@@ -1,0 +1,932 @@
+#!/usr/bin/env bash
+#
+# omarchy-vpn-picker - pick, connect, and disconnect VPNs from a menu.
+#
+# VPNs come from two places:
+#   * every *.ovpn file under VPN_DIR (default ~/vpn), with no setup needed;
+#   * drop-in profiles in ~/.config/vpn-picker/profiles/*.conf, which can add
+#     a display name, a NetworkManager connection, and credential sources such
+#     as 1Password (`op`) references for the username, password, and OTP.
+#
+# Credentials are never written to disk and never placed on a command line:
+# OpenVPN reads them from a pipe on its standard input, NetworkManager from a
+# process-substitution file descriptor.
+#
+# Run `omarchy-vpn-picker help` for the command list.
+
+set -uo pipefail
+
+VP_VERSION="0.1.0"
+VP_SELF=$(readlink -f "${BASH_SOURCE[0]}")
+VP_APP="VPN Picker"
+
+VP_GLOBAL_KEYS=(VPN_DIR MENU TERMINAL OP_ACCOUNT OPENVPN_ARGS)
+VP_PROFILE_KEYS=(NAME TYPE CONFIG CONNECTION USERNAME USERNAME_OP PASSWORD_OP
+  OTP_OP PASSWORD_MODE OTP_SEPARATOR OPENVPN_ARGS NM_SECRET_KEY OP_ACCOUNT)
+
+declare -A VP_KV=()
+declare -A VP_CONF=()
+declare -A PROFILE=()
+VP_ENTRY_IDS=()
+VP_ENTRY_LABELS=()
+VP_CRED_USER=""
+VP_CRED_PASS=""
+
+# --- messages ----------------------------------------------------------------
+
+vp_warn() { printf 'omarchy-vpn-picker: %s\n' "$*" >&2; }
+vp_die() { vp_warn "$*"; exit 1; }
+
+vp_notify() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "$VP_APP" "$*" >/dev/null 2>&1 || true
+  fi
+}
+
+# --- configuration -------------------------------------------------------------
+
+vp_init_paths() {
+  VP_CONFIG_DIR=${VPN_PICKER_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/vpn-picker}
+  VP_PROFILE_DIR="$VP_CONFIG_DIR/profiles"
+  VP_CONFIG_FILE="$VP_CONFIG_DIR/config"
+  VP_PROC_DIR=${VPN_PICKER_PROC_DIR:-/proc}
+  VP_OP=${VPN_PICKER_OP:-op}
+}
+
+# Expand a leading ~ or $HOME; nothing else is expanded.
+vp_expand_path() {
+  local p=$1
+  case $p in
+    \~) p=$HOME ;;
+    \~/*) p="$HOME/${p#\~/}" ;;
+    "\$HOME") p=$HOME ;;
+    "\$HOME/"*) p="$HOME/${p#"\$HOME/"}" ;;
+  esac
+  printf '%s' "$p"
+}
+
+# Parse KEY=value lines from a file into VP_KV. Files are parsed, never
+# sourced: blank lines and lines starting with # are skipped, a value may be
+# wrapped in matching double or single quotes (taken literally, no escapes),
+# and keys outside the allowed list are reported and ignored.
+#   vp_parse_kv <file> <allowed-key>...
+vp_parse_kv() {
+  local file=$1
+  shift
+  local -A allowed=()
+  local k
+  for k in "$@"; do allowed[$k]=1; done
+  VP_KV=()
+
+  local line key value n=0 status=0
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    line=${line%$'\r'}
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z $line || $line == \#* ]] && continue
+    if [[ $line =~ ^([A-Z][A-Z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      key=${BASH_REMATCH[1]}
+      value=${BASH_REMATCH[2]}
+    else
+      vp_warn "$file:$n: ignoring line that is not KEY=value"
+      status=2
+      continue
+    fi
+    if [[ -z ${allowed[$key]:-} ]]; then
+      vp_warn "$file:$n: ignoring unknown key '$key'"
+      status=2
+      continue
+    fi
+    if [[ $value =~ ^\"(.*)\"$ || $value =~ ^\'(.*)\'$ ]]; then
+      value=${BASH_REMATCH[1]}
+    fi
+    VP_KV[$key]=$value
+  done <"$file"
+  return "$status"
+}
+
+vp_load_global_config() {
+  vp_init_paths
+  VP_CONF=()
+  if [[ -f $VP_CONFIG_FILE ]]; then
+    vp_parse_kv "$VP_CONFIG_FILE" "${VP_GLOBAL_KEYS[@]}"
+    local k
+    for k in "${!VP_KV[@]}"; do VP_CONF[$k]=${VP_KV[$k]}; done
+  fi
+  [[ -n ${VPN_PICKER_VPN_DIR:-} ]] && VP_CONF[VPN_DIR]=$VPN_PICKER_VPN_DIR
+  [[ -n ${VPN_PICKER_MENU:-} ]] && VP_CONF[MENU]=$VPN_PICKER_MENU
+  [[ -n ${VPN_PICKER_TERMINAL:-} ]] && VP_CONF[TERMINAL]=$VPN_PICKER_TERMINAL
+  VP_CONF[VPN_DIR]=$(vp_expand_path "${VP_CONF[VPN_DIR]:-~/vpn}")
+  VP_CONF[VPN_DIR]=${VP_CONF[VPN_DIR]%/}
+  VP_CONF[MENU]=${VP_CONF[MENU]:-auto}
+  VP_CONF[TERMINAL]=${VP_CONF[TERMINAL]:-auto}
+  VP_CONF[OP_ACCOUNT]=${VP_CONF[OP_ACCOUNT]:-}
+  VP_CONF[OPENVPN_ARGS]=${VP_CONF[OPENVPN_ARGS]:-}
+  return 0
+}
+
+# Fill PROFILE from a profile file. Returns non-zero (with a message) when the
+# profile cannot be used.
+vp_load_profile() {
+  local file=$1
+  local id
+  id=$(basename "$file" .conf)
+  vp_parse_kv "$file" "${VP_PROFILE_KEYS[@]}"
+
+  PROFILE=()
+  local k
+  for k in "${VP_PROFILE_KEYS[@]}"; do PROFILE[$k]=${VP_KV[$k]:-}; done
+  PROFILE[ID]=$id
+  PROFILE[SOURCE]=$file
+  PROFILE[NAME]=${PROFILE[NAME]:-$id}
+
+  if [[ -z ${PROFILE[TYPE]} ]]; then
+    if [[ -n ${PROFILE[CONNECTION]} ]]; then PROFILE[TYPE]="nm"; else PROFILE[TYPE]="openvpn"; fi
+  fi
+
+  if [[ -n ${PROFILE[CONFIG]} ]]; then
+    PROFILE[CONFIG]=$(vp_expand_path "${PROFILE[CONFIG]}")
+    [[ ${PROFILE[CONFIG]} == /* ]] || PROFILE[CONFIG]="${VP_CONF[VPN_DIR]}/${PROFILE[CONFIG]}"
+  fi
+
+  if [[ -z ${PROFILE[PASSWORD_MODE]} ]]; then
+    if [[ -n ${PROFILE[OTP_OP]} && -n ${PROFILE[PASSWORD_OP]} ]]; then
+      PROFILE[PASSWORD_MODE]=password+otp
+    elif [[ -n ${PROFILE[OTP_OP]} ]]; then
+      PROFILE[PASSWORD_MODE]=otp
+    elif [[ -n ${PROFILE[PASSWORD_OP]} || -n ${PROFILE[USERNAME]} || -n ${PROFILE[USERNAME_OP]} ]]; then
+      PROFILE[PASSWORD_MODE]=password
+    else
+      PROFILE[PASSWORD_MODE]=none
+    fi
+  fi
+  PROFILE[NM_SECRET_KEY]=${PROFILE[NM_SECRET_KEY]:-vpn.secrets.password}
+  PROFILE[OP_ACCOUNT]=${PROFILE[OP_ACCOUNT]:-${VP_CONF[OP_ACCOUNT]:-}}
+
+  case ${PROFILE[TYPE]} in
+    openvpn)
+      [[ -n ${PROFILE[CONFIG]} ]] || { vp_warn "$file: TYPE=openvpn needs CONFIG"; return 1; }
+      ;;
+    nm)
+      [[ -n ${PROFILE[CONNECTION]} ]] || { vp_warn "$file: TYPE=nm needs CONNECTION"; return 1; }
+      ;;
+    *)
+      vp_warn "$file: TYPE must be openvpn or nm, not '${PROFILE[TYPE]}'"
+      return 1
+      ;;
+  esac
+  case ${PROFILE[PASSWORD_MODE]} in
+    none | password | otp | password+otp) ;;
+    *)
+      vp_warn "$file: PASSWORD_MODE must be none, password, otp, or password+otp"
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# A bare .ovpn file with no profile: connect through NetworkManager when a
+# connection with the same name exists (case-insensitive), else run openvpn.
+vp_load_discovered() {
+  local path=$1
+  local base nm_name
+  base=$(basename "$path")
+  base=${base%.*}
+  PROFILE=()
+  local k
+  for k in "${VP_PROFILE_KEYS[@]}"; do PROFILE[$k]=""; done
+  PROFILE[ID]="ovpn:${path#"${VP_CONF[VPN_DIR]}"/}"
+  PROFILE[SOURCE]=""
+  PROFILE[NAME]=${path#"${VP_CONF[VPN_DIR]}"/}
+  PROFILE[PASSWORD_MODE]=none
+  PROFILE[NM_SECRET_KEY]=vpn.secrets.password
+  PROFILE[OP_ACCOUNT]=${VP_CONF[OP_ACCOUNT]:-}
+  nm_name=$(vp_nm_connection_named "$base")
+  if [[ -n $nm_name ]]; then
+    PROFILE[TYPE]="nm"
+    PROFILE[CONNECTION]=$nm_name
+  else
+    PROFILE[TYPE]=openvpn
+    PROFILE[CONFIG]=$path
+  fi
+}
+
+# --- NetworkManager and process state ------------------------------------------
+
+# nmcli -t escapes ':' and '\' in values; undo that.
+vp_nm_unescape() {
+  local s=$1
+  s=${s//\\:/:}
+  s=${s//\\\\/\\}
+  printf '%s' "$s"
+}
+
+# Print the NetworkManager connection whose name equals $1 ignoring case.
+vp_nm_connection_named() {
+  command -v nmcli >/dev/null 2>&1 || return 0
+  local want=${1,,} line name
+  while IFS= read -r line; do
+    name=$(vp_nm_unescape "$line")
+    if [[ ${name,,} == "$want" ]]; then
+      printf '%s' "$name"
+      return 0
+    fi
+  done < <(nmcli -t -f NAME connection show 2>/dev/null)
+  return 0
+}
+
+# Print one active VPN per line as "nm<US>name" or "openvpn<US>pid<US>config",
+# where <US> is the ASCII unit separator (names may contain tabs or spaces).
+VP_US=$'\x1f'
+
+vp_active() {
+  local line type name pid
+  if command -v nmcli >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      type=${line%%:*}
+      name=$(vp_nm_unescape "${line#*:}")
+      case $type in
+        vpn | wireguard) printf 'nm%s%s\n' "$VP_US" "$name" ;;
+      esac
+    done < <(nmcli -t -f TYPE,NAME connection show --active 2>/dev/null)
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    while IFS= read -r pid; do
+      [[ $pid =~ ^[0-9]+$ ]] || continue
+      local cfg
+      cfg=$(vp_openvpn_config_of "$pid")
+      [[ -n $cfg ]] && printf 'openvpn%s%s%s%s\n' "$VP_US" "$pid" "$VP_US" "$cfg"
+    done < <(pgrep -x openvpn 2>/dev/null)
+  fi
+  return 0
+}
+
+# Print the --config path of an openvpn process, read from its NUL-separated
+# command line so paths with spaces survive.
+vp_openvpn_config_of() {
+  local pid=$1 arg next=0
+  local cmdline="$VP_PROC_DIR/$pid/cmdline"
+  [[ -r $cmdline ]] || return 0
+  while IFS= read -r -d '' arg; do
+    if ((next)); then
+      printf '%s' "$arg"
+      return 0
+    fi
+    case $arg in
+      --config) next=1 ;;
+      --config=*)
+        printf '%s' "${arg#--config=}"
+        return 0
+        ;;
+    esac
+  done <"$cmdline"
+  return 0
+}
+
+# Display label for an active openvpn config path.
+vp_label_for_config() {
+  local cfg=$1 f
+  if [[ -d $VP_PROFILE_DIR ]]; then
+    for f in "$VP_PROFILE_DIR"/*.conf; do
+      [[ -f $f ]] || continue
+      if vp_load_profile "$f" 2>/dev/null && [[ ${PROFILE[TYPE]} == openvpn ]] \
+        && [[ ${PROFILE[CONFIG]} == "$cfg" ]]; then
+        printf '%s' "${PROFILE[NAME]}"
+        return 0
+      fi
+    done
+  fi
+  if [[ $cfg == "${VP_CONF[VPN_DIR]}"/* ]]; then
+    printf '%s' "${cfg#"${VP_CONF[VPN_DIR]}"/}"
+  else
+    basename "$cfg"
+  fi
+}
+
+# --- entries ------------------------------------------------------------------
+
+vp_add_entry() {
+  local id=$1 label=$2 existing
+  for existing in "${VP_ENTRY_LABELS[@]}"; do
+    if [[ $existing == "$label" ]]; then
+      label="$label (${id#profile:})"
+      break
+    fi
+  done
+  VP_ENTRY_IDS+=("$id")
+  VP_ENTRY_LABELS+=("$label")
+}
+
+# Build VP_ENTRY_IDS / VP_ENTRY_LABELS: profiles first (sorted by file name),
+# then every *.ovpn under VPN_DIR that no profile already points at.
+vp_collect_entries() {
+  VP_ENTRY_IDS=()
+  VP_ENTRY_LABELS=()
+  local -A claimed=()
+  local f
+  if [[ -d $VP_PROFILE_DIR ]]; then
+    while IFS= read -r -d '' f; do
+      vp_load_profile "$f" || continue
+      vp_add_entry "profile:${PROFILE[ID]}" "${PROFILE[NAME]}"
+      [[ ${PROFILE[TYPE]} == openvpn ]] && claimed[${PROFILE[CONFIG]}]=1
+    done < <(find "$VP_PROFILE_DIR" -maxdepth 1 -type f -name '*.conf' -print0 | sort -z)
+  fi
+  if [[ -d ${VP_CONF[VPN_DIR]} ]]; then
+    while IFS= read -r -d '' f; do
+      [[ -n ${claimed[$f]:-} ]] && continue
+      vp_add_entry "ovpn:${f#"${VP_CONF[VPN_DIR]}"/}" "${f#"${VP_CONF[VPN_DIR]}"/}"
+    done < <(find "${VP_CONF[VPN_DIR]}" -type f -iname '*.ovpn' -print0 | sort -z)
+  fi
+  return 0
+}
+
+# Load PROFILE for an entry id ("profile:<id>" or "ovpn:<path under VPN_DIR>").
+vp_resolve() {
+  local id=$1
+  case $id in
+    profile:*)
+      local file="$VP_PROFILE_DIR/${id#profile:}.conf"
+      [[ ${id#profile:} != */* && -f $file ]] || { vp_warn "no such profile: ${id#profile:}"; return 1; }
+      vp_load_profile "$file"
+      ;;
+    ovpn:*)
+      local rel=${id#ovpn:}
+      [[ $rel != *..* ]] || { vp_warn "refusing path with '..': $rel"; return 1; }
+      local path="${VP_CONF[VPN_DIR]}/$rel"
+      [[ -f $path ]] || { vp_warn "no such file: $path"; return 1; }
+      vp_load_discovered "$path"
+      ;;
+    *)
+      # Accept a bare profile name or a path under VPN_DIR for CLI convenience.
+      if [[ -f "$VP_PROFILE_DIR/$id.conf" ]]; then
+        vp_resolve "profile:$id"
+      else
+        vp_resolve "ovpn:$id"
+      fi
+      ;;
+  esac
+}
+
+# --- credentials --------------------------------------------------------------
+
+vp_prompt() {
+  local label=$1 hidden=$2 value=""
+  if [[ $hidden == 1 ]]; then
+    IFS= read -r -s -p "$label: " value
+    [[ -t 0 ]] && printf '\n' >&2
+  else
+    IFS= read -r -p "$label: " value
+  fi
+  [[ -n $value ]] || return 1
+  printf '%s' "$value"
+}
+
+# Read a secret from 1Password when a reference is given and `op` works,
+# otherwise prompt for it.
+#   vp_secret <op-reference-or-empty> <label> <hidden 0|1>
+vp_secret() {
+  local ref=$1 label=$2 hidden=$3 value
+  if [[ -n $ref ]]; then
+    if command -v "$VP_OP" >/dev/null 2>&1; then
+      local -a op_args=(read --no-newline)
+      [[ -n ${PROFILE[OP_ACCOUNT]:-} ]] && op_args+=(--account "${PROFILE[OP_ACCOUNT]}")
+      if value=$("$VP_OP" "${op_args[@]}" "$ref" 2>/dev/null) && [[ -n $value ]]; then
+        printf '%s' "$value"
+        return 0
+      fi
+      vp_warn "1Password lookup failed for $label (is op signed in?); asking instead"
+    else
+      vp_warn "1Password CLI (op) not found; asking for $label instead"
+    fi
+  fi
+  vp_prompt "$label" "$hidden"
+}
+
+# Fill VP_CRED_USER and VP_CRED_PASS for PROFILE according to PASSWORD_MODE.
+# The OTP is always fetched last so it is as fresh as possible.
+vp_collect_credentials() {
+  VP_CRED_USER=""
+  VP_CRED_PASS=""
+  local mode=${PROFILE[PASSWORD_MODE]} pw otp
+  [[ $mode == none ]] && return 0
+
+  # NetworkManager keeps the username in the connection itself.
+  if [[ ${PROFILE[TYPE]} == openvpn ]]; then
+    if [[ -n ${PROFILE[USERNAME_OP]} ]]; then
+      VP_CRED_USER=$(vp_secret "${PROFILE[USERNAME_OP]}" "Username" 0) || return 1
+    elif [[ -n ${PROFILE[USERNAME]} ]]; then
+      VP_CRED_USER=${PROFILE[USERNAME]}
+    else
+      VP_CRED_USER=$(vp_prompt "Username" 0) || return 1
+    fi
+  fi
+
+  case $mode in
+    password)
+      VP_CRED_PASS=$(vp_secret "${PROFILE[PASSWORD_OP]}" "Password" 1) || return 1
+      ;;
+    otp)
+      VP_CRED_PASS=$(vp_secret "${PROFILE[OTP_OP]}" "One-time password" 1) || return 1
+      ;;
+    password+otp)
+      pw=$(vp_secret "${PROFILE[PASSWORD_OP]}" "Password" 1) || return 1
+      otp=$(vp_secret "${PROFILE[OTP_OP]}" "One-time password" 1) || return 1
+      VP_CRED_PASS="$pw${PROFILE[OTP_SEPARATOR]}$otp"
+      ;;
+  esac
+
+  if [[ $VP_CRED_USER == *$'\n'* || $VP_CRED_PASS == *$'\n'* ]]; then
+    vp_warn "credentials may not contain newlines"
+    return 1
+  fi
+  return 0
+}
+
+vp_clear_credentials() {
+  VP_CRED_USER=""
+  VP_CRED_PASS=""
+}
+
+# --- connect / disconnect -----------------------------------------------------
+
+# shellcheck disable=SC2034 # vp_words_out is a nameref to the caller's array
+vp_split_words() {
+  # Split a config value on whitespace into the named array (no globbing).
+  local -n vp_words_out=$1
+  vp_words_out=()
+  [[ -n $2 ]] || return 0
+  read -r -a vp_words_out <<<"$2"
+}
+
+vp_connect_openvpn() {
+  local cfg=${PROFILE[CONFIG]}
+  [[ -r $cfg ]] || { vp_warn "cannot read $cfg"; return 1; }
+
+  local -a global_extra profile_extra
+  vp_split_words global_extra "${VP_CONF[OPENVPN_ARGS]}"
+  vp_split_words profile_extra "${PROFILE[OPENVPN_ARGS]}"
+  local -a args=(--config "$cfg" "${global_extra[@]}" "${profile_extra[@]}")
+
+  # Ask for the sudo password before touching credentials, so a one-time
+  # password is not left ageing while sudo waits.
+  sudo -v || return 1
+
+  vp_collect_credentials || { vp_clear_credentials; return 1; }
+
+  local status
+  if [[ ${PROFILE[PASSWORD_MODE]} == none ]]; then
+    sudo openvpn "${args[@]}"
+    status=$?
+  else
+    # printf is a builtin: the secrets go straight into the pipe and never
+    # appear in any process's argv. OpenVPN reads both lines from stdin.
+    printf '%s\n%s\n' "$VP_CRED_USER" "$VP_CRED_PASS" |
+      sudo openvpn "${args[@]}" --auth-user-pass /dev/stdin
+    status=$?
+  fi
+  vp_clear_credentials
+  return "$status"
+}
+
+vp_connect_nm() {
+  local conn=${PROFILE[CONNECTION]}
+  vp_collect_credentials || { vp_clear_credentials; return 1; }
+  local status
+  if [[ ${PROFILE[PASSWORD_MODE]} == none ]]; then
+    nmcli --ask connection up id "$conn"
+    status=$?
+  else
+    nmcli --ask connection up id "$conn" \
+      passwd-file <(printf '%s:%s\n' "${PROFILE[NM_SECRET_KEY]}" "$VP_CRED_PASS")
+    status=$?
+  fi
+  vp_clear_credentials
+  return "$status"
+}
+
+# Connect to an entry in the current terminal.
+vp_cmd_connect() {
+  local id=${1:-}
+  [[ -n $id ]] || vp_die "usage: omarchy-vpn-picker connect <profile|file.ovpn>"
+  vp_resolve "$id" || return 1
+  local name=${PROFILE[NAME]} status
+  printf 'Connecting to %s...\n' "$name"
+  case ${PROFILE[TYPE]} in
+    nm)
+      vp_connect_nm
+      status=$?
+      if ((status == 0)); then vp_notify "Connected: $name"; else vp_notify "Failed to connect: $name"; fi
+      ;;
+    openvpn)
+      vp_connect_openvpn
+      status=$?
+      if ((status == 0)); then vp_notify "Disconnected: $name"; else vp_notify "OpenVPN exited ($status): $name"; fi
+      ;;
+  esac
+  return "$status"
+}
+
+vp_cmd_disconnect() {
+  local target=${1:-} line kind a b
+  if [[ -z $target ]]; then
+    # Disconnect everything that is active.
+    local rc=0
+    while IFS=$VP_US read -r kind a b; do
+      case $kind in
+        nm) vp_cmd_disconnect "nm:$a" || rc=1 ;;
+        openvpn) vp_cmd_disconnect "pid:$a" || rc=1 ;;
+      esac
+    done < <(vp_active)
+    return "$rc"
+  fi
+  case $target in
+    nm:*)
+      local conn=${target#nm:}
+      if nmcli connection down id "$conn" >/dev/null; then
+        vp_notify "Disconnected: $conn"
+      else
+        vp_notify "Failed to disconnect: $conn"
+        return 1
+      fi
+      ;;
+    pid:*)
+      local pid=${target#pid:} comm=""
+      [[ $pid =~ ^[0-9]+$ ]] || vp_die "bad pid: $pid"
+      [[ -r $VP_PROC_DIR/$pid/comm ]] && comm=$(<"$VP_PROC_DIR/$pid/comm")
+      [[ $comm == openvpn ]] || vp_die "process $pid is not openvpn"
+      sudo kill -TERM "$pid" || return 1
+      ;;
+    *)
+      vp_die "unknown disconnect target: $target (expected nm:<name> or pid:<pid>)"
+      ;;
+  esac
+}
+
+# Run a command in a new terminal window and wait for it.
+vp_in_terminal() {
+  local -a term
+  if [[ ${VP_CONF[TERMINAL]} != auto ]]; then
+    vp_split_words term "${VP_CONF[TERMINAL]}"
+  elif command -v xdg-terminal-exec >/dev/null 2>&1; then
+    term=(xdg-terminal-exec)
+  elif [[ -n ${TERMINAL:-} ]] && command -v "$TERMINAL" >/dev/null 2>&1; then
+    term=("$TERMINAL" -e)
+  else
+    vp_notify "No terminal found; set TERMINAL in $VP_CONFIG_FILE"
+    vp_die "no terminal found (install xdg-terminal-exec or set TERMINAL in $VP_CONFIG_FILE)"
+  fi
+  "${term[@]}" "$@"
+}
+
+# Body run inside the terminal: connect, and keep the window open on failure.
+vp_cmd_terminal_connect() {
+  vp_cmd_connect "$@"
+  local status=$?
+  if ((status != 0)); then
+    read -r -p "Connection ended with status $status. Press Enter to close..." _ || true
+  fi
+  return "$status"
+}
+
+vp_cmd_terminal_disconnect() {
+  vp_cmd_disconnect "$@"
+  local status=$?
+  if ((status != 0)); then
+    read -r -p "Disconnect failed. Press Enter to close..." _ || true
+  fi
+  return "$status"
+}
+
+# --- status ---------------------------------------------------------------------
+
+vp_json_str() {
+  local s=$1 out="" c i
+  for ((i = 0; i < ${#s}; i++)); do
+    c=${s:i:1}
+    case $c in
+      '"') out+='\"' ;;
+      "\\") out+="\\\\" ;;
+      $'\n') out+='\n' ;;
+      $'\t') out+='\t' ;;
+      $'\r') out+='\r' ;;
+      *)
+        if [[ $c < ' ' ]]; then
+          out+=$(printf '\\u%04x' "'$c")
+        else
+          out+=$c
+        fi
+        ;;
+    esac
+  done
+  printf '"%s"' "$out"
+}
+
+# Fill VP_ACTIVE_LABELS and VP_ACTIVE_TARGETS (nm:<name> / pid:<pid>).
+vp_collect_active() {
+  VP_ACTIVE_LABELS=()
+  VP_ACTIVE_TARGETS=()
+  local kind a b
+  while IFS=$VP_US read -r kind a b; do
+    case $kind in
+      nm)
+        VP_ACTIVE_LABELS+=("$a")
+        VP_ACTIVE_TARGETS+=("nm:$a")
+        ;;
+      openvpn)
+        VP_ACTIVE_LABELS+=("$(vp_label_for_config "$b")")
+        VP_ACTIVE_TARGETS+=("pid:$a")
+        ;;
+    esac
+  done < <(vp_active)
+}
+
+vp_cmd_status() {
+  vp_collect_active
+  local n=${#VP_ACTIVE_LABELS[@]} joined="" l
+  for l in "${VP_ACTIVE_LABELS[@]}"; do
+    joined+=${joined:+, }$l
+  done
+  if [[ ${1:-} == --json ]]; then
+    local list="" tooltip
+    for l in "${VP_ACTIVE_LABELS[@]}"; do
+      list+=${list:+,}$(vp_json_str "$l")
+    done
+    if ((n > 0)); then tooltip="VPN: $joined"; else tooltip="VPN: not connected"; fi
+    printf '{"connected":%s,"count":%d,"text":%s,"tooltip":%s,"class":"%s","connections":[%s]}\n' \
+      "$( ((n > 0)) && echo true || echo false)" "$n" "$(vp_json_str "$joined")" \
+      "$(vp_json_str "$tooltip")" "$( ((n > 0)) && echo connected || echo disconnected)" "$list"
+  elif ((n > 0)); then
+    printf 'Connected: %s\n' "$joined"
+  else
+    printf 'Not connected\n'
+  fi
+}
+
+vp_cmd_list() {
+  vp_collect_entries
+  local i
+  for i in "${!VP_ENTRY_IDS[@]}"; do
+    printf '%s\t%s\n' "${VP_ENTRY_IDS[i]}" "${VP_ENTRY_LABELS[i]}"
+  done
+}
+
+# --- menu -----------------------------------------------------------------------
+
+# Show a menu. Rows arrive on stdin as "<icon><TAB><label>"; prints the label.
+vp_menu() {
+  local prompt=$1 backend=${VP_CONF[MENU]}
+  local -a rows labels
+  mapfile -t rows
+  local r
+  for r in "${rows[@]}"; do labels+=("${r#*$'\t'}"); done
+
+  if [[ $backend == auto ]]; then
+    if command -v omarchy-menu-select >/dev/null 2>&1 && command -v omarchy-shell >/dev/null 2>&1; then
+      backend=omarchy
+    else
+      for backend in walker fuzzel rofi wofi none; do
+        [[ $backend == none ]] && break
+        command -v "$backend" >/dev/null 2>&1 && break
+      done
+      [[ $backend == none ]] && vp_die "no menu program found (omarchy-menu-select, walker, fuzzel, rofi, or wofi)"
+    fi
+  fi
+
+  case $backend in
+    omarchy) omarchy-menu-select "$prompt" "${rows[@]}" ;;
+    walker) printf '%s\n' "${labels[@]}" | walker --dmenu --placeholder "$prompt" ;;
+    fuzzel) printf '%s\n' "${labels[@]}" | fuzzel --dmenu --prompt "$prompt: " ;;
+    rofi) printf '%s\n' "${labels[@]}" | rofi -dmenu -i -p "$prompt" ;;
+    wofi) printf '%s\n' "${labels[@]}" | wofi --dmenu --prompt "$prompt" ;;
+    *)
+      local -a custom
+      vp_split_words custom "$backend"
+      printf '%s\n' "${labels[@]}" | "${custom[@]}"
+      ;;
+  esac
+}
+
+VP_ICON_ON=$'\U000f0582'   # nf-md-vpn
+VP_ICON_OFF=$'\U000f099e'  # nf-md-shield_off_outline
+VP_ICON_DISCONNECT=$'\U000f0156' # nf-md-close
+VP_ICON_ENTRY=$'\U000f0582'
+
+vp_cmd_menu() {
+  vp_collect_entries
+  vp_collect_active
+
+  local -a rows=() actions=()
+  local i joined="" l
+  for l in "${VP_ACTIVE_LABELS[@]}"; do joined+=${joined:+, }$l; done
+
+  if ((${#VP_ACTIVE_LABELS[@]} > 0)); then
+    rows+=("$VP_ICON_ON"$'\t'"Status: connected to $joined")
+    actions+=("noop")
+    for i in "${!VP_ACTIVE_LABELS[@]}"; do
+      rows+=("$VP_ICON_DISCONNECT"$'\t'"Disconnect ${VP_ACTIVE_LABELS[i]}")
+      actions+=("disconnect:${VP_ACTIVE_TARGETS[i]}")
+    done
+  else
+    rows+=("$VP_ICON_OFF"$'\t'"Status: not connected")
+    actions+=("noop")
+  fi
+
+  for i in "${!VP_ENTRY_IDS[@]}"; do
+    rows+=("$VP_ICON_ENTRY"$'\t'"${VP_ENTRY_LABELS[i]}")
+    actions+=("connect:${VP_ENTRY_IDS[i]}")
+  done
+
+  if ((${#VP_ENTRY_IDS[@]} == 0)); then
+    vp_notify "No VPNs found. Add .ovpn files to ${VP_CONF[VPN_DIR]} or profiles to $VP_PROFILE_DIR"
+  fi
+
+  local choice
+  choice=$(printf '%s\n' "${rows[@]}" | vp_menu "VPN") || return 0
+  choice=${choice%%$'\n'*}
+  [[ -n $choice ]] || return 0
+
+  local action=""
+  for i in "${!rows[@]}"; do
+    if [[ ${rows[i]#*$'\t'} == "$choice" ]]; then
+      action=${actions[i]}
+      break
+    fi
+  done
+
+  case $action in
+    "" | noop) return 0 ;;
+    disconnect:nm:*)
+      vp_cmd_disconnect "${action#disconnect:}"
+      ;;
+    disconnect:pid:*)
+      vp_in_terminal "$VP_SELF" __terminal-disconnect "${action#disconnect:}"
+      ;;
+    connect:*)
+      local id=${action#connect:}
+      vp_resolve "$id" || { vp_notify "Cannot use $choice (see omarchy-vpn-picker doctor)"; return 1; }
+      vp_in_terminal "$VP_SELF" __terminal-connect "$id"
+      ;;
+  esac
+}
+
+# --- add / doctor -----------------------------------------------------------------
+
+vp_slug() {
+  local s=${1,,}
+  s=${s//[^a-z0-9._-]/-}
+  while [[ $s == *--* ]]; do s=${s//--/-}; done
+  s=${s#-}
+  s=${s%-}
+  printf '%s' "${s:-vpn}"
+}
+
+# Copy an .ovpn file into VPN_DIR (mode 600) and write a profile for it.
+vp_cmd_add() {
+  local src="" name=""
+  while (($# > 0)); do
+    case $1 in
+      --name)
+        name=${2:-}
+        shift 2 || vp_die "--name needs a value"
+        ;;
+      -*) vp_die "unknown option: $1" ;;
+      *)
+        [[ -z $src ]] || vp_die "only one .ovpn file at a time"
+        src=$1
+        shift
+        ;;
+    esac
+  done
+  [[ -n $src && -f $src ]] || vp_die "usage: omarchy-vpn-picker add <file.ovpn> [--name \"Display Name\"]"
+
+  local base id dest profile
+  base=$(basename "$src")
+  [[ -n $name ]] || name=${base%.*}
+  id=$(vp_slug "$name")
+  dest="${VP_CONF[VPN_DIR]}/$base"
+  profile="$VP_PROFILE_DIR/$id.conf"
+
+  [[ -e $profile ]] && vp_die "profile already exists: $profile"
+  mkdir -p "${VP_CONF[VPN_DIR]}" "$VP_PROFILE_DIR" || return 1
+  chmod 700 "${VP_CONF[VPN_DIR]}" 2>/dev/null || true
+  if [[ $(readlink -f "$src") != $(readlink -f "$dest" 2>/dev/null) ]]; then
+    [[ -e $dest ]] && vp_die "already exists: $dest"
+    install -m 600 "$src" "$dest" || return 1
+  fi
+
+  (
+    umask 077
+    cat >"$profile" <<EOF
+# VPN profile for omarchy-vpn-picker. See the README for every key.
+NAME="$name"
+CONFIG="$base"
+
+# Credentials (optional). Leave these out and OpenVPN asks on its own.
+# A static username plus a one-time password as the password:
+#USERNAME="your-username"
+#OTP_OP="op://Private/$name/one-time password?attrtype=otp"
+#
+# Or a password plus OTP joined together (PASSWORD_MODE=password+otp):
+#USERNAME_OP="op://Private/$name/username"
+#PASSWORD_OP="op://Private/$name/password"
+#PASSWORD_MODE=password+otp
+#OTP_SEPARATOR=""
+EOF
+  ) || return 1
+  printf 'Added %s\n  config:  %s\n  profile: %s\n' "$name" "$dest" "$profile"
+  printf 'Edit the profile to add 1Password references, then pick "%s" from the menu.\n' "$name"
+}
+
+vp_cmd_doctor() {
+  local ok=1 tool
+  printf 'omarchy-vpn-picker %s\n' "$VP_VERSION"
+  printf 'config dir:  %s\n' "$VP_CONFIG_DIR"
+  printf 'vpn dir:     %s%s\n' "${VP_CONF[VPN_DIR]}" "$([[ -d ${VP_CONF[VPN_DIR]} ]] || echo ' (missing)')"
+  for tool in openvpn nmcli sudo; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      printf 'ok:      %s\n' "$tool"
+    else
+      printf 'missing: %s\n' "$tool"
+      ok=0
+    fi
+  done
+  if command -v "$VP_OP" >/dev/null 2>&1; then
+    local -a whoami=(whoami)
+    [[ -n ${VP_CONF[OP_ACCOUNT]} ]] && whoami+=(--account "${VP_CONF[OP_ACCOUNT]}")
+    if "$VP_OP" "${whoami[@]}" >/dev/null 2>&1; then
+      printf 'ok:      op (signed in)\n'
+    else
+      printf 'ok:      op (not signed in now; it will ask, or the picker prompts instead)\n'
+    fi
+  else
+    printf 'info:    op not installed (1Password fill disabled; the picker prompts instead)\n'
+  fi
+
+  local f
+  if [[ -d $VP_PROFILE_DIR ]]; then
+    for f in "$VP_PROFILE_DIR"/*.conf; do
+      [[ -f $f ]] || continue
+      if vp_load_profile "$f"; then
+        printf 'profile: %s -> %s %s (credentials: %s)\n' "${PROFILE[ID]}" "${PROFILE[TYPE]}" \
+          "${PROFILE[CONFIG]:-${PROFILE[CONNECTION]}}" "${PROFILE[PASSWORD_MODE]}"
+        if [[ ${PROFILE[TYPE]} == openvpn && ! -r ${PROFILE[CONFIG]} ]]; then
+          printf 'warning: %s: config not readable\n' "${PROFILE[ID]}"
+          ok=0
+        fi
+      else
+        printf 'error:   %s is invalid\n' "$f"
+        ok=0
+      fi
+    done
+  fi
+  vp_collect_entries
+  printf 'entries: %d\n' "${#VP_ENTRY_IDS[@]}"
+  ((ok))
+}
+
+vp_usage() {
+  cat <<'EOF'
+Usage: omarchy-vpn-picker [command]
+
+Commands:
+  menu                 Show the VPN menu (default)
+  connect <name>       Connect in this terminal (profile name or file under VPN_DIR)
+  disconnect [target]  Disconnect nm:<connection>, pid:<openvpn pid>, or everything
+  status [--json]      Show active VPNs
+  list                 List menu entries as <id><TAB><label>
+  add <file.ovpn> [--name "Display Name"]
+                       Copy a config into VPN_DIR and create a profile for it
+  doctor               Check dependencies and profiles
+  version              Print the version
+
+Config: ~/.config/vpn-picker/config and ~/.config/vpn-picker/profiles/*.conf
+EOF
+}
+
+vp_main() {
+  vp_load_global_config
+  local cmd=${1:-menu}
+  (($# > 0)) && shift
+  case $cmd in
+    menu) vp_cmd_menu ;;
+    connect) vp_cmd_connect "$@" ;;
+    disconnect) vp_cmd_disconnect "$@" ;;
+    status) vp_cmd_status "$@" ;;
+    list) vp_cmd_list ;;
+    add) vp_cmd_add "$@" ;;
+    doctor) vp_cmd_doctor ;;
+    version | --version) printf '%s\n' "$VP_VERSION" ;;
+    help | -h | --help) vp_usage ;;
+    __terminal-connect) vp_cmd_terminal_connect "$@" ;;
+    __terminal-disconnect) vp_cmd_terminal_disconnect "$@" ;;
+    *)
+      vp_usage >&2
+      return 2
+      ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  vp_main "$@"
+fi
