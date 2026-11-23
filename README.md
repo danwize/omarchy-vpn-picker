@@ -224,6 +224,9 @@ Limitations:
   challenge answer in the terminal.
 - OpenVPN keeps running in its terminal window. Closing the window or
   pressing Ctrl+C disconnects, and so does "Disconnect" in the menu.
+- OpenVPN gets the credentials once, at connect time. If the tunnel restarts
+  on its own (ping-restart, network change), the cached one-time password has
+  expired and the reconnect fails; reconnect from the menu.
 
 ## Development
 

@@ -391,7 +391,7 @@ vp_secret() {
     if command -v "$VP_OP" >/dev/null 2>&1; then
       local -a op_args=(read --no-newline)
       [[ -n ${PROFILE[OP_ACCOUNT]:-} ]] && op_args+=(--account "${PROFILE[OP_ACCOUNT]}")
-      if value=$("$VP_OP" "${op_args[@]}" "$ref" 2>/dev/null) && [[ -n $value ]]; then
+      if value=$("$VP_OP" "${op_args[@]}" "$ref") && [[ -n $value ]]; then
         printf '%s' "$value"
         return 0
       fi
@@ -622,11 +622,13 @@ vp_json_str() {
   printf '"%s"' "$out"
 }
 
-# Fill VP_ACTIVE_LABELS and VP_ACTIVE_TARGETS (nm:<name> / pid:<pid>).
+# Fill VP_ACTIVE_LABELS, VP_ACTIVE_TARGETS (nm:<name> / pid:<pid>) and
+# VP_ACTIVE_JOINED (labels joined with ", ").
 vp_collect_active() {
   VP_ACTIVE_LABELS=()
   VP_ACTIVE_TARGETS=()
-  local kind a b
+  VP_ACTIVE_JOINED=""
+  local kind a b l
   while IFS=$VP_US read -r kind a b; do
     case $kind in
       nm)
@@ -639,14 +641,14 @@ vp_collect_active() {
         ;;
     esac
   done < <(vp_active)
+  for l in "${VP_ACTIVE_LABELS[@]}"; do
+    VP_ACTIVE_JOINED+=${VP_ACTIVE_JOINED:+, }$l
+  done
 }
 
 vp_cmd_status() {
   vp_collect_active
-  local n=${#VP_ACTIVE_LABELS[@]} joined="" l
-  for l in "${VP_ACTIVE_LABELS[@]}"; do
-    joined+=${joined:+, }$l
-  done
+  local n=${#VP_ACTIVE_LABELS[@]} joined=$VP_ACTIVE_JOINED l
   if [[ ${1:-} == --json ]]; then
     local list="" tooltip
     for l in "${VP_ACTIVE_LABELS[@]}"; do
@@ -717,11 +719,10 @@ vp_cmd_menu() {
   vp_collect_active
 
   local -a rows=() actions=()
-  local i joined="" l
-  for l in "${VP_ACTIVE_LABELS[@]}"; do joined+=${joined:+, }$l; done
+  local i
 
   if ((${#VP_ACTIVE_LABELS[@]} > 0)); then
-    rows+=("$VP_ICON_ON"$'\t'"Status: connected to $joined")
+    rows+=("$VP_ICON_ON"$'\t'"Status: connected to $VP_ACTIVE_JOINED")
     actions+=("noop")
     for i in "${!VP_ACTIVE_LABELS[@]}"; do
       rows+=("$VP_ICON_DISCONNECT"$'\t'"Disconnect ${VP_ACTIVE_LABELS[i]}")
