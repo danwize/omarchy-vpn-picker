@@ -45,7 +45,8 @@ EOF
   mkdir -p "$CONFIG_DIR/profiles"
   chmod 700 "$CONFIG_DIR" "$CONFIG_DIR/profiles"
   [[ -e $CONFIG_DIR/config ]] || install -m 600 "$SRC/examples/config" "$CONFIG_DIR/config"
-  install -m 600 "$SRC/examples/profiles/example.conf" "$CONFIG_DIR/profiles/example.conf.sample"
+  [[ -e $CONFIG_DIR/profiles/example.conf.sample ]] ||
+    install -m 600 "$SRC/examples/profiles/example.conf" "$CONFIG_DIR/profiles/example.conf.sample"
 
   echo "Installed $TARGET"
   echo "Launcher entry: $DESKTOP"

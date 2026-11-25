@@ -23,7 +23,8 @@ app-launcher entry on its own.
 - `openvpn` and `sudo` for `.ovpn` configs, and/or NetworkManager (`nmcli`)
   for NM VPN connections
 - A menu: Omarchy's own menu (used automatically), or `walker`, `fuzzel`,
-  `rofi`, or `wofi`
+  `rofi`, or `wofi`. Without one, the picker shows a notification and exits
+  with an error (`omarchy-vpn-picker doctor` reports it too).
 - `xdg-terminal-exec` (Omarchy has it) or another terminal. Connecting
   happens in a terminal window so you can answer `sudo` and see OpenVPN's log.
 - Optional: the [1Password CLI](https://developer.1password.com/docs/cli/) (`op`)
@@ -38,8 +39,10 @@ omarchy plugin add https://github.com/danwize/omarchy-vpn-picker --enable
 
 This puts a VPN icon in the bar. The icon is dimmed while nothing is
 connected. Left-click opens the picker, right-click shows the status, and
-middle-click refreshes. In the widget settings you can change the refresh
-interval or hide the icon while disconnected.
+middle-click refreshes. The icon updates as soon as a connect or disconnect
+finishes (the picker touches `$XDG_RUNTIME_DIR/omarchy-vpn-picker.changed`,
+which the widget watches), and otherwise on a timer. In the widget settings
+you can change the refresh interval or hide the icon while disconnected.
 
 To also get a "VPN Picker" entry in the app launcher, run the installer from
 the plugin folder:
@@ -62,8 +65,9 @@ The installer:
 - copies the picker to `~/.local/bin/omarchy-vpn-picker`;
 - adds `~/.local/share/applications/omarchy-vpn-picker.desktop`, which shows
   up as "VPN Picker" in the app launcher;
-- creates `~/.config/vpn-picker/config` and a sample profile. It never
-  overwrites a file you already have.
+- creates `~/.config/vpn-picker/config` and a sample profile
+  (`profiles/example.conf.sample`). It never overwrites a file you already
+  have, including an edited sample.
 
 Run `./install.sh` again to update. `./install.sh --uninstall` removes the
 script and the launcher entry and leaves your config and VPN files alone.
@@ -84,6 +88,8 @@ If you only installed the plugin, use the full path
 **Simplest:** drop the provider's `.ovpn` file into `~/vpn`. It appears in the
 menu under its file name. If a NetworkManager connection has the same name as
 the file (ignoring case), the picker connects through NetworkManager instead.
+`~/vpn` may be a symlink, and symlinked subfolders, `.ovpn` files, and
+profiles are followed.
 
 **With a profile:** let the picker copy the file and write a profile for it:
 
@@ -118,7 +124,9 @@ PASSWORD_MODE=password+otp
 
 Profiles and the config file are plain `KEY=value` lines. They are parsed,
 never executed. Quotes around a value are optional and are taken literally.
-Lines starting with `#` are comments.
+Lines starting with `#` are comments, and so is anything after whitespace
+and `#` following a value (`CONFIG=work.ovpn  # office`). Quote a value that
+itself contains ` #`.
 
 ### Profile keys
 
@@ -151,7 +159,9 @@ A value with no 1Password reference is asked for in the terminal. For example,
 `PASSWORD_MODE=otp` without `OTP_OP` prompts for the code.
 
 The OTP is always fetched last, after `sudo` has its password, so the code is
-as fresh as possible when OpenVPN sends it.
+as fresh as possible when OpenVPN sends it. If `sudo` would not ask (a cached
+login, or a `NOPASSWD` sudoers rule for `openvpn`), there is no password
+prompt at all.
 
 ### Global settings
 

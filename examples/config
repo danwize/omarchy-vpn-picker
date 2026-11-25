@@ -1,8 +1,10 @@
 # omarchy-vpn-picker settings. Every line is optional.
 # Format: KEY=value, one per line. The file is parsed, never executed.
+# A " # comment" after a value is ignored; quote a value that contains " #".
 
 # Directory scanned (recursively) for *.ovpn files. Each one shows up in the
-# menu without needing a profile. ~ and $HOME are expanded.
+# menu without needing a profile. ~ and $HOME are expanded. Symlinks (to the
+# directory, subfolders, or files) are followed.
 VPN_DIR=~/vpn
 
 # Menu program: auto (Omarchy menu, then walker, fuzzel, rofi, wofi),

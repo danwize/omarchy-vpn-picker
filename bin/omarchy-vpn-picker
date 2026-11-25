@@ -31,6 +31,7 @@ VP_ENTRY_IDS=()
 VP_ENTRY_LABELS=()
 VP_CRED_USER=""
 VP_CRED_PASS=""
+VP_MENU_BACKEND=""
 
 # --- messages ----------------------------------------------------------------
 
@@ -51,6 +52,17 @@ vp_init_paths() {
   VP_CONFIG_FILE="$VP_CONFIG_DIR/config"
   VP_PROC_DIR=${VPN_PICKER_PROC_DIR:-/proc}
   VP_OP=${VPN_PICKER_OP:-op}
+  # Touched after every connect or disconnect so the bar widget can refresh.
+  VP_STATE_FILE=${VPN_PICKER_STATE_FILE:-}
+  if [[ -z $VP_STATE_FILE && -n ${XDG_RUNTIME_DIR:-} ]]; then
+    VP_STATE_FILE="$XDG_RUNTIME_DIR/omarchy-vpn-picker.changed"
+  fi
+}
+
+# Tell watchers (the bar widget) that the VPN state may have changed.
+vp_signal_change() {
+  [[ -n $VP_STATE_FILE ]] || return 0
+  printf '%s\n' "${EPOCHREALTIME:-$(date +%s)}" >"$VP_STATE_FILE" 2>/dev/null || true
 }
 
 # Expand a leading ~ or $HOME; nothing else is expanded.
@@ -68,7 +80,9 @@ vp_expand_path() {
 # Parse KEY=value lines from a file into VP_KV. Files are parsed, never
 # sourced: blank lines and lines starting with # are skipped, a value may be
 # wrapped in matching double or single quotes (taken literally, no escapes),
-# and keys outside the allowed list are reported and ignored.
+# a " # comment" after a value (whitespace, then #) is dropped, and keys
+# outside the allowed list are reported and ignored. A value that itself
+# contains " #" must be quoted.
 #   vp_parse_kv <file> <allowed-key>...
 vp_parse_kv() {
   local file=$1
@@ -98,8 +112,13 @@ vp_parse_kv() {
       status=2
       continue
     fi
-    if [[ $value =~ ^\"(.*)\"$ || $value =~ ^\'(.*)\'$ ]]; then
+    if [[ $value =~ ^\"([^\"]*)\"[[:space:]]*(#.*)?$ || $value =~ ^\'([^\']*)\'[[:space:]]*(#.*)?$ ]]; then
       value=${BASH_REMATCH[1]}
+    elif [[ $value =~ ^\"(.*)\"$ || $value =~ ^\'(.*)\'$ ]]; then
+      value=${BASH_REMATCH[1]}
+    else
+      value=${value%%[[:space:]]#*}
+      value="${value%"${value##*[![:space:]]}"}"
     fi
     VP_KV[$key]=$value
   done <"$file"
@@ -148,6 +167,9 @@ vp_load_profile() {
   if [[ -n ${PROFILE[CONFIG]} ]]; then
     PROFILE[CONFIG]=$(vp_expand_path "${PROFILE[CONFIG]}")
     [[ ${PROFILE[CONFIG]} == /* ]] || PROFILE[CONFIG]="${VP_CONF[VPN_DIR]}/${PROFILE[CONFIG]}"
+    # One canonical form, so menu claims and active-connection labels agree
+    # however the path was written (./, //, symlinks).
+    PROFILE[CONFIG]=$(realpath -m -- "${PROFILE[CONFIG]}")
   fi
 
   if [[ -z ${PROFILE[PASSWORD_MODE]} ]]; then
@@ -286,17 +308,15 @@ vp_openvpn_config_of() {
 
 # Display label for an active openvpn config path.
 vp_label_for_config() {
-  local cfg=$1 f
-  if [[ -d $VP_PROFILE_DIR ]]; then
-    for f in "$VP_PROFILE_DIR"/*.conf; do
-      [[ -f $f ]] || continue
-      if vp_load_profile "$f" 2>/dev/null && [[ ${PROFILE[TYPE]} == openvpn ]] \
-        && [[ ${PROFILE[CONFIG]} == "$cfg" ]]; then
-        printf '%s' "${PROFILE[NAME]}"
-        return 0
-      fi
-    done
-  fi
+  local cfg=$1 f want
+  want=$(realpath -m -- "$cfg")
+  while IFS= read -r -d '' f; do
+    if vp_load_profile "$f" 2>/dev/null && [[ ${PROFILE[TYPE]} == openvpn ]] \
+      && [[ ${PROFILE[CONFIG]} == "$want" ]]; then
+      printf '%s' "${PROFILE[NAME]}"
+      return 0
+    fi
+  done < <(vp_profile_files)
   if [[ $cfg == "${VP_CONF[VPN_DIR]}"/* ]]; then
     printf '%s' "${cfg#"${VP_CONF[VPN_DIR]}"/}"
   else
@@ -318,26 +338,37 @@ vp_add_entry() {
   VP_ENTRY_LABELS+=("$label")
 }
 
+# Print every profile file (NUL-separated, sorted). Symlinked profiles are
+# followed, the same way everywhere profiles are read.
+vp_profile_files() {
+  [[ -d $VP_PROFILE_DIR ]] || return 0
+  find -L "$VP_PROFILE_DIR/" -mindepth 1 -maxdepth 1 -type f -name '*.conf' -print0 2>/dev/null | sort -z
+}
+
+# Print every *.ovpn under VPN_DIR (NUL-separated, sorted). A symlinked
+# VPN_DIR, symlinked subfolders, and symlinked .ovpn files are followed.
+vp_ovpn_files() {
+  [[ -d ${VP_CONF[VPN_DIR]} ]] || return 0
+  find -L "${VP_CONF[VPN_DIR]}/" -mindepth 1 -type f -iname '*.ovpn' -print0 2>/dev/null | sort -z
+}
+
 # Build VP_ENTRY_IDS / VP_ENTRY_LABELS: profiles first (sorted by file name),
 # then every *.ovpn under VPN_DIR that no profile already points at.
 vp_collect_entries() {
   VP_ENTRY_IDS=()
   VP_ENTRY_LABELS=()
   local -A claimed=()
-  local f
-  if [[ -d $VP_PROFILE_DIR ]]; then
-    while IFS= read -r -d '' f; do
-      vp_load_profile "$f" || continue
-      vp_add_entry "profile:${PROFILE[ID]}" "${PROFILE[NAME]}"
-      [[ ${PROFILE[TYPE]} == openvpn ]] && claimed[$(realpath -m -- "${PROFILE[CONFIG]}")]=1
-    done < <(find "$VP_PROFILE_DIR" -maxdepth 1 -type f -name '*.conf' -print0 | sort -z)
-  fi
-  if [[ -d ${VP_CONF[VPN_DIR]} ]]; then
-    while IFS= read -r -d '' f; do
-      [[ -n ${claimed[$(realpath -m -- "$f")]:-} ]] && continue
-      vp_add_entry "ovpn:${f#"${VP_CONF[VPN_DIR]}"/}" "${f#"${VP_CONF[VPN_DIR]}"/}"
-    done < <(find "${VP_CONF[VPN_DIR]}" -type f -iname '*.ovpn' -print0 | sort -z)
-  fi
+  local f rel
+  while IFS= read -r -d '' f; do
+    vp_load_profile "$f" || continue
+    vp_add_entry "profile:${PROFILE[ID]}" "${PROFILE[NAME]}"
+    [[ ${PROFILE[TYPE]} == openvpn ]] && claimed[${PROFILE[CONFIG]}]=1
+  done < <(vp_profile_files)
+  while IFS= read -r -d '' f; do
+    [[ -n ${claimed[$(realpath -m -- "$f")]:-} ]] && continue
+    rel=${f#"${VP_CONF[VPN_DIR]}"/}
+    vp_add_entry "ovpn:$rel" "$rel"
+  done < <(vp_ovpn_files)
   return 0
 }
 
@@ -352,7 +383,7 @@ vp_resolve() {
       ;;
     ovpn:*)
       local rel=${id#ovpn:}
-      [[ $rel != *..* ]] || { vp_warn "refusing path with '..': $rel"; return 1; }
+      [[ /$rel/ != */../* ]] || { vp_warn "refusing path with a '..' segment: $rel"; return 1; }
       local path="${VP_CONF[VPN_DIR]}/$rel"
       [[ -f $path ]] || { vp_warn "no such file: $path"; return 1; }
       vp_load_discovered "$path"
@@ -469,24 +500,54 @@ vp_connect_openvpn() {
   local -a args=(--config "$cfg" "${global_extra[@]}" "${profile_extra[@]}")
 
   # Ask for the sudo password before touching credentials, so a one-time
-  # password is not left ageing while sudo waits.
-  sudo -v || return 1
+  # password is not left ageing while sudo waits. Skipped when sudo would
+  # not ask anyway (cached timestamp or a NOPASSWD rule for openvpn).
+  if vp_sudo_needs_password; then
+    sudo -v || return 1
+  fi
 
   vp_collect_credentials || { vp_clear_credentials; return 1; }
 
-  local status
+  local -a st
   if [[ ${PROFILE[PASSWORD_MODE]} == none ]]; then
-    sudo openvpn "${args[@]}"
-    status=$?
-  else
-    # printf is a builtin: the secrets go straight into the pipe and never
-    # appear in any process's argv. OpenVPN reads both lines from stdin.
-    printf '%s\n%s\n' "$VP_CRED_USER" "$VP_CRED_PASS" |
-      sudo openvpn "${args[@]}" --auth-user-pass /dev/stdin
-    status=$?
+    sudo openvpn "${args[@]}" | vp_watch_openvpn
+    st=("${PIPESTATUS[@]}")
+    vp_clear_credentials
+    vp_signal_change
+    return "${st[0]}"
   fi
+  # printf is a builtin: the secrets go straight into the pipe and never
+  # appear in any process's argv. OpenVPN reads both lines from stdin.
+  printf '%s\n%s\n' "$VP_CRED_USER" "$VP_CRED_PASS" |
+    sudo openvpn "${args[@]}" --auth-user-pass /dev/stdin | vp_watch_openvpn
+  st=("${PIPESTATUS[@]}")
   vp_clear_credentials
-  return "$status"
+  vp_signal_change
+  return "${st[1]}"
+}
+
+# True when `sudo openvpn` would ask for a password: no cached sudo
+# timestamp, and no NOPASSWD rule that covers openvpn.
+vp_sudo_needs_password() {
+  sudo -n true 2>/dev/null && return 1
+  local rules
+  rules=$(sudo -n -l 2>/dev/null) || return 0
+  local line
+  while IFS= read -r line; do
+    [[ $line == *NOPASSWD:* && ${line#*NOPASSWD:} =~ (^|[[:space:],/])(openvpn|ALL)([[:space:],]|$) ]] && return 1
+  done <<<"$rules"
+  return 0
+}
+
+# Pass OpenVPN's log through to the terminal and signal the bar widget once
+# the tunnel is up.
+vp_watch_openvpn() {
+  local line
+  while IFS= read -r line; do
+    printf '%s\n' "$line"
+    [[ $line == *"Initialization Sequence Completed"* ]] && vp_signal_change
+  done
+  return 0
 }
 
 vp_connect_nm() {
@@ -502,6 +563,7 @@ vp_connect_nm() {
     status=$?
   fi
   vp_clear_credentials
+  vp_signal_change
   return "$status"
 }
 
@@ -544,8 +606,10 @@ vp_cmd_disconnect() {
     nm:*)
       local conn=${target#nm:}
       if nmcli connection down id "$conn" >/dev/null; then
+        vp_signal_change
         vp_notify "Disconnected: $conn"
       else
+        vp_signal_change
         vp_notify "Failed to disconnect: $conn"
         return 1
       fi
@@ -556,6 +620,13 @@ vp_cmd_disconnect() {
       [[ -r $VP_PROC_DIR/$pid/comm ]] && comm=$(<"$VP_PROC_DIR/$pid/comm")
       [[ $comm == openvpn ]] || { vp_warn "process $pid is not openvpn"; return 1; }
       sudo kill -TERM "$pid" || return 1
+      # Give OpenVPN a moment to exit so the next status check is accurate.
+      local i
+      for ((i = 0; i < 50; i++)); do
+        [[ -e $VP_PROC_DIR/$pid ]] || break
+        sleep 0.1
+      done
+      vp_signal_change
       ;;
     *)
       vp_warn "unknown disconnect target: $target (expected nm:<name> or pid:<pid>)"
@@ -676,14 +747,11 @@ vp_cmd_list() {
 
 # --- menu -----------------------------------------------------------------------
 
-# Show a menu. Rows arrive on stdin as "<icon><TAB><label>"; prints the label.
-vp_menu() {
-  local prompt=$1 backend=${VP_CONF[MENU]}
-  local -a rows labels
-  mapfile -t rows
-  local r
-  for r in "${rows[@]}"; do labels+=("${r#*$'\t'}"); done
-
+# Pick the menu program into VP_MENU_BACKEND. Runs in the main shell (not in
+# the menu pipeline) so a missing program is reported, not swallowed.
+vp_menu_backend() {
+  local backend=${VP_CONF[MENU]}
+  local -a words
   if [[ $backend == auto ]]; then
     if command -v omarchy-menu-select >/dev/null 2>&1 && command -v omarchy-shell >/dev/null 2>&1; then
       backend=omarchy
@@ -692,9 +760,31 @@ vp_menu() {
         [[ $backend == none ]] && break
         command -v "$backend" >/dev/null 2>&1 && break
       done
-      [[ $backend == none ]] && vp_die "no menu program found (omarchy-menu-select, walker, fuzzel, rofi, or wofi)"
+      if [[ $backend == none ]]; then
+        vp_warn "no menu program found (omarchy-menu-select, walker, fuzzel, rofi, or wofi)"
+        return 1
+      fi
+    fi
+  elif [[ $backend == omarchy ]]; then
+    command -v omarchy-menu-select >/dev/null 2>&1 || { vp_warn "MENU=omarchy but omarchy-menu-select is not installed"; return 1; }
+  else
+    vp_split_words words "$backend"
+    if ((${#words[@]} == 0)) || ! command -v "${words[0]}" >/dev/null 2>&1; then
+      vp_warn "menu program not found: ${words[0]:-$backend}"
+      return 1
     fi
   fi
+  VP_MENU_BACKEND=$backend
+}
+
+# Show a menu with VP_MENU_BACKEND. Rows arrive on stdin as
+# "<icon><TAB><label>"; prints the chosen label.
+vp_menu() {
+  local prompt=$1 backend=$VP_MENU_BACKEND
+  local -a rows labels
+  mapfile -t rows
+  local r
+  for r in "${rows[@]}"; do labels+=("${r#*$'\t'}"); done
 
   case $backend in
     omarchy) omarchy-menu-select "$prompt" "${rows[@]}" ;;
@@ -743,6 +833,12 @@ vp_cmd_menu() {
     vp_notify "No VPNs found. Add .ovpn files to ${VP_CONF[VPN_DIR]} or profiles to $VP_PROFILE_DIR"
   fi
 
+  if ! vp_menu_backend; then
+    vp_notify "No menu program found. Install walker, fuzzel, rofi, or wofi, or set MENU in $VP_CONFIG_FILE"
+    return 1
+  fi
+
+  # A non-zero exit from the menu program means the menu was dismissed.
   local choice
   choice=$(printf '%s\n' "${rows[@]}" | vp_menu "VPN") || return 0
   choice=${choice%%$'\n'*}
@@ -866,21 +962,22 @@ vp_cmd_doctor() {
   fi
 
   local f
-  if [[ -d $VP_PROFILE_DIR ]]; then
-    for f in "$VP_PROFILE_DIR"/*.conf; do
-      [[ -f $f ]] || continue
-      if vp_load_profile "$f"; then
-        printf 'profile: %s -> %s %s (credentials: %s)\n' "${PROFILE[ID]}" "${PROFILE[TYPE]}" \
-          "${PROFILE[CONFIG]:-${PROFILE[CONNECTION]}}" "${PROFILE[PASSWORD_MODE]}"
-        if [[ ${PROFILE[TYPE]} == openvpn && ! -r ${PROFILE[CONFIG]} ]]; then
-          printf 'warning: %s: config not readable\n' "${PROFILE[ID]}"
-          ok=0
-        fi
-      else
-        printf 'error:   %s is invalid\n' "$f"
+  while IFS= read -r -d '' f; do
+    if vp_load_profile "$f"; then
+      printf 'profile: %s -> %s %s (credentials: %s)\n' "${PROFILE[ID]}" "${PROFILE[TYPE]}" \
+        "${PROFILE[CONFIG]:-${PROFILE[CONNECTION]}}" "${PROFILE[PASSWORD_MODE]}"
+      if [[ ${PROFILE[TYPE]} == openvpn && ! -r ${PROFILE[CONFIG]} ]]; then
+        printf 'warning: %s: config not readable\n' "${PROFILE[ID]}"
         ok=0
       fi
-    done
+    else
+      printf 'error:   %s is invalid\n' "$f"
+      ok=0
+    fi
+  done < <(vp_profile_files)
+  if ! vp_menu_backend 2>/dev/null; then
+    printf 'missing: a menu program (omarchy-menu-select, walker, fuzzel, rofi, or wofi, or MENU)\n'
+    ok=0
   fi
   vp_collect_entries
   printf 'entries: %d\n' "${#VP_ENTRY_IDS[@]}"

@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
@@ -6,7 +7,9 @@ import qs.Ui
 // Bar widget for omarchy-vpn-picker. Polls `bin/omarchy-vpn-picker status
 // --json` from this plugin folder and shows a VPN glyph, dimmed while nothing
 // is connected. Left-click opens the picker menu, right-click shows the
-// status as a notification, middle-click refreshes.
+// status as a notification, middle-click refreshes. The picker touches
+// $XDG_RUNTIME_DIR/omarchy-vpn-picker.changed when a connect or disconnect
+// finishes (or an OpenVPN tunnel comes up), and the widget refreshes then.
 BarWidget {
   id: root
   moduleName: "io.github.danwize.vpn-picker"
@@ -19,8 +22,12 @@ BarWidget {
   property bool connected: false
   property string tooltip: "VPN: not connected"
 
+  // A refresh asked for while a check is running runs right after it.
+  property bool refreshQueued: false
+
   function refresh() {
-    if (!statusProc.running) statusProc.running = true
+    if (statusProc.running) root.refreshQueued = true
+    else statusProc.running = true
   }
 
   function applyStatus(text) {
@@ -41,6 +48,12 @@ BarWidget {
   Process {
     id: statusProc
     command: [root.script, "status", "--json"]
+    onExited: {
+      if (root.refreshQueued) {
+        root.refreshQueued = false
+        Qt.callLater(root.refresh)
+      }
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyStatus(text)
@@ -55,13 +68,15 @@ BarWidget {
     onTriggered: root.refresh()
   }
 
-  // A connect or disconnect started from the menu settles a few seconds
-  // later; check again soon instead of waiting for the next interval.
-  Timer {
-    id: settleTimer
-    interval: 4000
-    repeat: false
-    onTriggered: root.refresh()
+  // Refresh as soon as a connect or disconnect finishes instead of waiting
+  // for the next interval. The menu itself runs detached, so an OpenVPN
+  // session survives a shell reload.
+  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
+  FileView {
+    path: root.runtimeDir ? root.runtimeDir + "/omarchy-vpn-picker.changed" : ""
+    watchChanges: true
+    printErrors: false
+    onFileChanged: root.refresh()
   }
 
   BarIconButton {
@@ -80,7 +95,6 @@ BarWidget {
         Util.execArgv(["notify-send", "VPN Picker", root.tooltip])
       } else {
         Util.execArgv([root.script, "menu"])
-        settleTimer.restart()
       }
     }
   }
