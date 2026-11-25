@@ -251,6 +251,11 @@ omarchy plugin validate .                      # on an Omarchy machine
 The tests run against a temporary `HOME`, with stub `nmcli`, `openvpn`,
 `sudo`, `op`, menu, and terminal programs.
 
+The GitHub Actions workflow (`.github/workflows/ci.yml`) only calls
+`tests/ci.sh`. If the Actions job reports that it "was not started" (for
+example, because the account is locked over billing), nothing in the code was
+checked. Run `tests/ci.sh` locally and treat its result as the CI result.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
