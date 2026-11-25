@@ -7,6 +7,7 @@
 #   tests/ci.sh
 #
 # Uses `shellcheck` from PATH, or falls back to `uvx --from shellcheck-py`.
+# Requires `jq`, so the manifest and JSON checks in tests/run.sh always run.
 
 set -euo pipefail
 
@@ -18,6 +19,12 @@ elif command -v uvx >/dev/null 2>&1; then
   shellcheck=(uvx --from shellcheck-py shellcheck)
 else
   echo "ci: shellcheck not found (install it, or install uv for uvx)" >&2
+  exit 1
+fi
+
+# tests/run.sh skips its manifest and JSON checks without jq; CI must not.
+if ! command -v jq >/dev/null 2>&1; then
+  echo "ci: jq not found (tests/run.sh would skip the manifest and JSON checks)" >&2
   exit 1
 fi
 

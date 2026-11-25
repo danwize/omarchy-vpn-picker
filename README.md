@@ -249,7 +249,8 @@ omarchy plugin validate .                      # on an Omarchy machine
 ```
 
 The tests run against a temporary `HOME`, with stub `nmcli`, `openvpn`,
-`sudo`, `op`, menu, and terminal programs.
+`sudo`, `op`, menu, and terminal programs. `tests/ci.sh` also needs `jq`, so
+the manifest and JSON checks are never skipped.
 
 The GitHub Actions workflow (`.github/workflows/ci.yml`) only calls
 `tests/ci.sh`. If the Actions job reports that it "was not started" (for
