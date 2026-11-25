@@ -242,8 +242,9 @@ Limitations:
 ## Development
 
 ```sh
+tests/ci.sh                                    # everything CI runs (below)
 tests/run.sh                                   # stubbed tests, no root, no network
-shellcheck -x bin/omarchy-vpn-picker install.sh tests/run.sh
+shellcheck -x bin/omarchy-vpn-picker install.sh tests/run.sh tests/ci.sh
 omarchy plugin validate .                      # on an Omarchy machine
 ```
 

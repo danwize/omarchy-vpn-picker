@@ -13,13 +13,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: ShellCheck
-        run: shellcheck -x bin/omarchy-vpn-picker install.sh tests/run.sh
-      - name: Tests
-        run: tests/run.sh
-      - name: No VPN configs or keys committed
-        run: |
-          if git ls-files | grep -Ei '\.(ovpn|key|crt|pem|p12|pfx)$'; then
-            echo "VPN configs, keys, or certificates must not be committed" >&2
-            exit 1
-          fi
+      - name: ShellCheck, tests, and secret-file check
+        run: tests/ci.sh
