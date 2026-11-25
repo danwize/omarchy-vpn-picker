@@ -85,6 +85,11 @@ exec "$@"'
   # state file was touched by then.
   stub openvpn 'printf "openvpn argv:" >>"$STUB_LOG"; printf " [%s]" "$@" >>"$STUB_LOG"; echo >>"$STUB_LOG"
 prev=""; for a in "$@"; do if [[ $prev == --auth-user-pass ]]; then printf "authfile:%s\n" "$(cat "$a")" >>"$STUB_LOG"; fi; prev=$a; done
+if [[ ${OPENVPN_WAIT_INT:-} == 1 ]]; then
+  trap '"'"'echo "SIGINT received, process exiting"; echo "openvpn got INT" >>"$STUB_LOG"; exit 0'"'"' INT
+  : >"$STUB_LOG.running"
+  while :; do sleep 0.1; done
+fi
 if [[ ${OPENVPN_UP:-} == 1 ]]; then
   echo "2026-01-01 Initialization Sequence Completed"
   for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s $VPN_PICKER_STATE_FILE ]] && break; sleep 0.1; done
@@ -160,9 +165,18 @@ PASSWORD_OP=op://Private/Item/pass#word
 OTP_OP=op://Private/Item/otp?attrtype=otp	# tab before the comment
 OTP_SEPARATOR=#
 EOF
+  cat >"$XDG_CONFIG_HOME/vpn-picker/profiles/e.conf" <<'EOF'
+CONFIG=example.ovpn
+OTP_SEPARATOR= # none
+USERNAME=	# fill in later
+EOF
   # shellcheck source=/dev/null
   source "$PICKER"
   vp_load_global_config
+  vp_load_profile "$XDG_CONFIG_HOME/vpn-picker/profiles/e.conf"
+  assert_eq "$?" 0 "load status (empty values)"
+  assert_eq "${PROFILE[OTP_SEPARATOR]}" "" "whitespace then # after = is an empty value"
+  assert_eq "${PROFILE[USERNAME]}" "" "tab then # after = is an empty value"
   vp_load_profile "$XDG_CONFIG_HOME/vpn-picker/profiles/c.conf"
   assert_eq "$?" 0 "load status"
   assert_eq "${PROFILE[NAME]}" "Example # VPN" "# inside quotes kept, comment after quotes dropped"
@@ -364,6 +378,26 @@ test_openvpn_output_state_and_status() {
   teardown
 }
 
+test_ctrl_c_during_openvpn() {
+  setup ctrl_c
+  : >"$HOME/vpn/plain.ovpn"
+  local out="$T/out" pid rc=0
+  set -m
+  OPENVPN_WAIT_INT=1 "$PICKER" connect plain.ovpn </dev/null >"$out" 2>&1 &
+  pid=$!
+  set +m
+  for _ in $(seq 50); do [[ -e $STUB_LOG.running ]] && break; sleep 0.1; done
+  rm -f "$VPN_PICKER_STATE_FILE"
+  kill -INT -- "-$pid"
+  wait "$pid" || rc=$?
+  assert_eq "$rc" 0 "picker exits normally after Ctrl+C"
+  assert_contains "$(log)" "openvpn got INT" "OpenVPN received SIGINT"
+  assert_contains "$(cat "$out")" "process exiting" "OpenVPN shutdown log still shown"
+  [[ -s $VPN_PICKER_STATE_FILE ]] && ok || bad "state file touched after Ctrl+C"
+  assert_contains "$(log)" "notify:" "notification sent after Ctrl+C"
+  teardown
+}
+
 test_no_credentials_for_plain_ovpn() {
   setup plain_ovpn
   : >"$HOME/vpn/plain.ovpn"
@@ -394,7 +428,14 @@ test_nm_connect() {
 test_status() {
   setup status
   local out
+  rm -f "$VPN_PICKER_STATE_FILE"
   out=$(picker status --json)
+  [[ -e $VPN_PICKER_STATE_FILE ]] && ok || bad "status creates a missing state file"
+  printf 'keep\n' >"$VPN_PICKER_STATE_FILE"
+  touch -d '2020-01-01' "$VPN_PICKER_STATE_FILE"
+  picker status >/dev/null
+  assert_eq "$(cat "$VPN_PICKER_STATE_FILE")" "keep" "status leaves an existing state file alone"
+  assert_eq "$(stat -c %Y "$VPN_PICKER_STATE_FILE")" "$(date -d '2020-01-01' +%s)" "status does not touch an existing state file"
   assert_eq "$out" '{"connected":false,"count":0,"text":"","tooltip":"VPN: not connected","class":"disconnected","connections":[]}' "disconnected json"
   mkdir -p "$T/proc/4242"
   printf 'openvpn\0--config\0%s\0--auth-user-pass\0/dev/stdin\0' "$HOME/vpn/my \"vpn\".ovpn" >"$T/proc/4242/cmdline"

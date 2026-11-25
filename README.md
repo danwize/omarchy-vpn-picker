@@ -125,8 +125,9 @@ PASSWORD_MODE=password+otp
 Profiles and the config file are plain `KEY=value` lines. They are parsed,
 never executed. Quotes around a value are optional and are taken literally.
 Lines starting with `#` are comments, and so is anything after whitespace
-and `#` following a value (`CONFIG=work.ovpn  # office`). Quote a value that
-itself contains ` #`.
+and `#` following a value (`CONFIG=work.ovpn  # office`), or after
+whitespace following `=` (`OTP_SEPARATOR= # none` sets an empty value, while
+`OTP_SEPARATOR=#` is a literal `#`). Quote a value that itself contains ` #`.
 
 ### Profile keys
 

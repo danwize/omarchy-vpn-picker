@@ -25,6 +25,10 @@ BarWidget {
   // A refresh asked for while a check is running runs right after it.
   property bool refreshQueued: false
 
+  // Set after the first status check, which creates the state file, so the
+  // FileView starts on a file that exists.
+  property bool watchReady: false
+
   function refresh() {
     if (statusProc.running) root.refreshQueued = true
     else statusProc.running = true
@@ -49,6 +53,7 @@ BarWidget {
     id: statusProc
     command: [root.script, "status", "--json"]
     onExited: {
+      root.watchReady = true
       if (root.refreshQueued) {
         root.refreshQueued = false
         Qt.callLater(root.refresh)
@@ -73,7 +78,7 @@ BarWidget {
   // session survives a shell reload.
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
   FileView {
-    path: root.runtimeDir ? root.runtimeDir + "/omarchy-vpn-picker.changed" : ""
+    path: root.watchReady && root.runtimeDir ? root.runtimeDir + "/omarchy-vpn-picker.changed" : ""
     watchChanges: true
     printErrors: false
     onFileChanged: root.refresh()

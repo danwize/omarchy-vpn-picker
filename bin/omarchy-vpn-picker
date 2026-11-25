@@ -59,6 +59,13 @@ vp_init_paths() {
   fi
 }
 
+# Create the state file if it is missing, without touching an existing one,
+# so a watcher has something to watch before the first connect.
+vp_ensure_state_file() {
+  [[ -n $VP_STATE_FILE && ! -e $VP_STATE_FILE ]] || return 0
+  : >>"$VP_STATE_FILE" 2>/dev/null || true
+}
+
 # Tell watchers (the bar widget) that the VPN state may have changed.
 vp_signal_change() {
   [[ -n $VP_STATE_FILE ]] || return 0
@@ -99,9 +106,10 @@ vp_parse_kv() {
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z $line || $line == \#* ]] && continue
-    if [[ $line =~ ^([A-Z][A-Z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+    if [[ $line =~ ^([A-Z][A-Z0-9_]*)[[:space:]]*=([[:space:]]*)(.*)$ ]]; then
       key=${BASH_REMATCH[1]}
-      value=${BASH_REMATCH[2]}
+      value=${BASH_REMATCH[3]}
+      [[ -n ${BASH_REMATCH[2]} && $value == \#* ]] && value=""
     else
       vp_warn "$file:$n: ignoring line that is not KEY=value"
       status=2
@@ -542,6 +550,7 @@ vp_sudo_needs_password() {
 # Pass OpenVPN's log through to the terminal and signal the bar widget once
 # the tunnel is up.
 vp_watch_openvpn() {
+  trap '' INT
   local line
   while IFS= read -r line; do
     printf '%s\n' "$line"
@@ -719,6 +728,7 @@ vp_collect_active() {
 }
 
 vp_cmd_status() {
+  vp_ensure_state_file
   vp_collect_active
   local n=${#VP_ACTIVE_LABELS[@]} joined=$VP_ACTIVE_JOINED l
   if [[ ${1:-} == --json ]]; then
