@@ -329,12 +329,12 @@ vp_collect_entries() {
     while IFS= read -r -d '' f; do
       vp_load_profile "$f" || continue
       vp_add_entry "profile:${PROFILE[ID]}" "${PROFILE[NAME]}"
-      [[ ${PROFILE[TYPE]} == openvpn ]] && claimed[${PROFILE[CONFIG]}]=1
+      [[ ${PROFILE[TYPE]} == openvpn ]] && claimed[$(realpath -m -- "${PROFILE[CONFIG]}")]=1
     done < <(find "$VP_PROFILE_DIR" -maxdepth 1 -type f -name '*.conf' -print0 | sort -z)
   fi
   if [[ -d ${VP_CONF[VPN_DIR]} ]]; then
     while IFS= read -r -d '' f; do
-      [[ -n ${claimed[$f]:-} ]] && continue
+      [[ -n ${claimed[$(realpath -m -- "$f")]:-} ]] && continue
       vp_add_entry "ovpn:${f#"${VP_CONF[VPN_DIR]}"/}" "${f#"${VP_CONF[VPN_DIR]}"/}"
     done < <(find "${VP_CONF[VPN_DIR]}" -type f -iname '*.ovpn' -print0 | sort -z)
   fi
@@ -552,13 +552,14 @@ vp_cmd_disconnect() {
       ;;
     pid:*)
       local pid=${target#pid:} comm=""
-      [[ $pid =~ ^[0-9]+$ ]] || vp_die "bad pid: $pid"
+      [[ $pid =~ ^[0-9]+$ ]] || { vp_warn "bad pid: $pid"; return 1; }
       [[ -r $VP_PROC_DIR/$pid/comm ]] && comm=$(<"$VP_PROC_DIR/$pid/comm")
-      [[ $comm == openvpn ]] || vp_die "process $pid is not openvpn"
+      [[ $comm == openvpn ]] || { vp_warn "process $pid is not openvpn"; return 1; }
       sudo kill -TERM "$pid" || return 1
       ;;
     *)
-      vp_die "unknown disconnect target: $target (expected nm:<name> or pid:<pid>)"
+      vp_warn "unknown disconnect target: $target (expected nm:<name> or pid:<pid>)"
+      return 1
       ;;
   esac
 }

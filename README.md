@@ -135,7 +135,7 @@ Lines starting with `#` are comments.
 | `PASSWORD_MODE` | What is sent as the password. `none` sends nothing and OpenVPN prompts itself. `password` sends the password. `otp` sends the OTP alone. `password+otp` sends the password, then `OTP_SEPARATOR`, then the OTP. |
 | `OTP_SEPARATOR` | Text between password and OTP in `password+otp`. Defaults to nothing. |
 | `OP_ACCOUNT` | 1Password account for `op --account`, if you have several. |
-| `OPENVPN_ARGS` | Extra OpenVPN arguments, split on spaces, e.g. `--auth-nocache`. |
+| `OPENVPN_ARGS` | Extra OpenVPN arguments, split on spaces, e.g. `--verb 3`. Do not use `--auth-nocache`: credentials are sent once on stdin, so OpenVPN cannot re-read them on renegotiation. |
 | `NM_SECRET_KEY` | NetworkManager secret that receives the password. Defaults to `vpn.secrets.password`. |
 
 When `PASSWORD_MODE` is unset, it is inferred:

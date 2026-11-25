@@ -18,4 +18,5 @@ TERMINAL=auto
 #OP_ACCOUNT=my.1password.com
 
 # Extra arguments for every OpenVPN connection.
-#OPENVPN_ARGS=--auth-nocache
+#OPENVPN_ARGS=--verb 3
+# (--auth-nocache breaks reconnects: credentials are sent once on stdin.)

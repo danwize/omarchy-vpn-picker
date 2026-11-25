@@ -183,6 +183,9 @@ test_list_entries() {
   local out
   out=$(picker list 2>&1)
   assert_eq "$out" $'profile:claimed\tClaimed VPN\nprofile:work\tWork\novpn:plain.ovpn\tplain.ovpn\novpn:sub/Other.OVPN\tsub/Other.OVPN' "entries"
+  printf 'NAME="Other"\nCONFIG=./sub//Other.OVPN\n' >"$XDG_CONFIG_HOME/vpn-picker/profiles/other.conf"
+  out=$(picker list 2>&1)
+  assert_not_contains "$out" "ovpn:sub/Other.OVPN" "non-canonical CONFIG path still claims the file"
   teardown
 }
 
@@ -210,13 +213,13 @@ test_credentials_otp_from_op() {
 test_credentials_password_plus_otp() {
   setup credentials_password_plus_otp
   : >"$HOME/vpn/example.ovpn"
-  printf 'CONFIG=example.ovpn\nUSERNAME_OP=op://Private/Example VPN/username\nPASSWORD_OP=op://Private/Example VPN/password\nOTP_OP=op://Private/Example VPN/otp?attrtype=otp\nOTP_SEPARATOR=":"\nOPENVPN_ARGS=--auth-nocache --verb 3\n' \
+  printf 'CONFIG=example.ovpn\nUSERNAME_OP=op://Private/Example VPN/username\nPASSWORD_OP=op://Private/Example VPN/password\nOTP_OP=op://Private/Example VPN/otp?attrtype=otp\nOTP_SEPARATOR=":"\nOPENVPN_ARGS=--mute 5 --verb 3\n' \
     >"$XDG_CONFIG_HOME/vpn-picker/profiles/example.conf"
   picker connect example </dev/null >/dev/null 2>&1
   local l
   l=$(log)
   assert_contains "$l" "authfile:op-user"$'\n'"op-pass:123456" "password+otp joined with separator"
-  assert_contains "$l" "[--auth-nocache] [--verb] [3] [--auth-user-pass]" "extra openvpn args"
+  assert_contains "$l" "[--mute] [5] [--verb] [3] [--auth-user-pass]" "extra openvpn args"
   teardown
 }
 
@@ -315,6 +318,9 @@ test_disconnect_pid_guard() {
   printf 'openvpn\n' >"$T/proc/99/comm"
   picker disconnect pid:99 >/dev/null 2>&1
   assert_contains "$(log)" "kill:-TERM 99" "kills openvpn pid via sudo"
+  local out
+  out=$(picker disconnect pid:12345 2>&1; echo "rc=$?")
+  assert_contains "$out" "rc=1" "missing pid fails without dying"
   teardown
 }
 
