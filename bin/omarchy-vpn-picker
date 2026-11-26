@@ -32,6 +32,8 @@ VP_ENTRY_LABELS=()
 VP_CRED_USER=""
 VP_CRED_PASS=""
 VP_MENU_BACKEND=""
+VP_OPENVPN_STARTED=0
+VP_CONNECT_ERROR=""
 
 # --- messages ----------------------------------------------------------------
 
@@ -252,17 +254,20 @@ vp_nm_unescape() {
   printf '%s' "$s"
 }
 
-# Print the NetworkManager connection whose name equals $1 ignoring case.
+# Print the NetworkManager VPN (or WireGuard) connection whose name equals $1
+# ignoring case. Other connection types (Wi-Fi, Ethernet, ...) never match.
 vp_nm_connection_named() {
   command -v nmcli >/dev/null 2>&1 || return 0
-  local want=${1,,} line name
+  local want=${1,,} line type name
   while IFS= read -r line; do
-    name=$(vp_nm_unescape "$line")
+    type=${line%%:*}
+    [[ $type == vpn || $type == wireguard ]] || continue
+    name=$(vp_nm_unescape "${line#*:}")
     if [[ ${name,,} == "$want" ]]; then
       printf '%s' "$name"
       return 0
     fi
-  done < <(nmcli -t -f NAME connection show 2>/dev/null)
+  done < <(nmcli -t -f TYPE,NAME connection show 2>/dev/null)
   return 0
 }
 
@@ -498,23 +503,65 @@ vp_split_words() {
   read -r -a vp_words_out <<<"$2"
 }
 
+# True when the profile's OpenVPN config or extra arguments use auth-nocache.
+# With credentials sent once on stdin, OpenVPN then cannot answer the
+# server's next authentication (renegotiation) and the tunnel drops.
+vp_uses_auth_nocache() {
+  local -a extra
+  local w
+  vp_split_words extra "${VP_CONF[OPENVPN_ARGS]} ${PROFILE[OPENVPN_ARGS]}"
+  for w in "${extra[@]}"; do
+    [[ $w == --auth-nocache ]] && return 0
+  done
+  [[ -r ${PROFILE[CONFIG]} ]] &&
+    grep -Eq '^[[:space:]]*auth-nocache([[:space:]]|$)' -- "${PROFILE[CONFIG]}" 2>/dev/null
+}
+
+VP_AUTH_NOCACHE_WARNING="uses auth-nocache, but the picker sends credentials once: the tunnel will drop at the next renegotiation (often after an hour). Remove auth-nocache from the .ovpn file or OPENVPN_ARGS."
+
+# Connect with openvpn. VP_OPENVPN_STARTED says whether openvpn ran at all,
+# and VP_CONNECT_ERROR says why not when it did not.
 vp_connect_openvpn() {
+  VP_OPENVPN_STARTED=0
+  VP_CONNECT_ERROR=""
   local cfg=${PROFILE[CONFIG]}
-  [[ -r $cfg ]] || { vp_warn "cannot read $cfg"; return 1; }
+  [[ -r $cfg ]] || {
+    vp_warn "cannot read $cfg"
+    VP_CONNECT_ERROR="cannot read $cfg"
+    return 1
+  }
 
   local -a global_extra profile_extra
   vp_split_words global_extra "${VP_CONF[OPENVPN_ARGS]}"
   vp_split_words profile_extra "${PROFILE[OPENVPN_ARGS]}"
-  local -a args=(--config "$cfg" "${global_extra[@]}" "${profile_extra[@]}")
+  # --cd first, so relative ca/cert/key/tls-auth paths in the config resolve
+  # next to the config file rather than in the current directory.
+  local cfg_dir
+  cfg_dir=$(dirname -- "$(realpath -m -- "$cfg")")
+  local -a args=(--cd "$cfg_dir" --config "$cfg" "${global_extra[@]}" "${profile_extra[@]}")
+
+  if [[ ${PROFILE[PASSWORD_MODE]} != none ]] && vp_uses_auth_nocache; then
+    vp_warn "${PROFILE[NAME]} $VP_AUTH_NOCACHE_WARNING"
+    vp_notify "${PROFILE[NAME]} $VP_AUTH_NOCACHE_WARNING"
+  fi
 
   # Ask for the sudo password before touching credentials, so a one-time
   # password is not left ageing while sudo waits. Skipped when sudo would
   # not ask anyway (cached timestamp or a NOPASSWD rule for openvpn).
   if vp_sudo_needs_password; then
-    sudo -v || return 1
+    sudo -v || {
+      VP_CONNECT_ERROR="sudo was cancelled or failed"
+      return 1
+    }
   fi
 
-  vp_collect_credentials || { vp_clear_credentials; return 1; }
+  vp_collect_credentials || {
+    vp_clear_credentials
+    VP_CONNECT_ERROR="no credentials were given"
+    return 1
+  }
+
+  VP_OPENVPN_STARTED=1
 
   local -a st
   if [[ ${PROFILE[PASSWORD_MODE]} == none ]]; then
@@ -592,7 +639,13 @@ vp_cmd_connect() {
     openvpn)
       vp_connect_openvpn
       status=$?
-      if ((status == 0)); then vp_notify "Disconnected: $name"; else vp_notify "OpenVPN exited ($status): $name"; fi
+      if ((status == 0)); then
+        vp_notify "Disconnected: $name"
+      elif ((VP_OPENVPN_STARTED)); then
+        vp_notify "OpenVPN exited ($status): $name"
+      else
+        vp_notify "Not connected: $name (${VP_CONNECT_ERROR:-cancelled})"
+      fi
       ;;
   esac
   return "$status"
@@ -825,8 +878,13 @@ vp_cmd_menu() {
   if ((${#VP_ACTIVE_LABELS[@]} > 0)); then
     rows+=("$VP_ICON_ON"$'\t'"Status: connected to $VP_ACTIVE_JOINED")
     actions+=("noop")
+    local label
     for i in "${!VP_ACTIVE_LABELS[@]}"; do
-      rows+=("$VP_ICON_DISCONNECT"$'\t'"Disconnect ${VP_ACTIVE_LABELS[i]}")
+      label="Disconnect ${VP_ACTIVE_LABELS[i]}"
+      # OpenVPN rows name their process, so two tunnels with the same label
+      # (or the same config started twice) stay distinct.
+      [[ ${VP_ACTIVE_TARGETS[i]} == pid:* ]] && label+=" (pid ${VP_ACTIVE_TARGETS[i]#pid:})"
+      rows+=("$VP_ICON_DISCONNECT"$'\t'"$label")
       actions+=("disconnect:${VP_ACTIVE_TARGETS[i]}")
     done
   else
@@ -837,6 +895,22 @@ vp_cmd_menu() {
   for i in "${!VP_ENTRY_IDS[@]}"; do
     rows+=("$VP_ICON_ENTRY"$'\t'"${VP_ENTRY_LABELS[i]}")
     actions+=("connect:${VP_ENTRY_IDS[i]}")
+  done
+
+  # Every row label must be unique: the menu hands back only the label, and it
+  # is mapped back to exactly one row. A label that repeats an earlier row
+  # (an entry called "Status: not connected", say) gets a numbered suffix.
+  local -A row_of=()
+  local text n
+  for i in "${!rows[@]}"; do
+    text=${rows[i]#*$'\t'}
+    if [[ -n ${row_of[$text]+x} ]]; then
+      n=2
+      while [[ -n ${row_of["$text [$n]"]+x} ]]; do n=$((n + 1)); done
+      text="$text [$n]"
+      rows[i]=${rows[i]%%$'\t'*}$'\t'$text
+    fi
+    row_of[$text]=$i
   done
 
   if ((${#VP_ENTRY_IDS[@]} == 0)); then
@@ -855,12 +929,7 @@ vp_cmd_menu() {
   [[ -n $choice ]] || return 0
 
   local action=""
-  for i in "${!rows[@]}"; do
-    if [[ ${rows[i]#*$'\t'} == "$choice" ]]; then
-      action=${actions[i]}
-      break
-    fi
-  done
+  [[ -n ${row_of[$choice]+x} ]] && action=${actions[${row_of[$choice]}]}
 
   case $action in
     "" | noop) return 0 ;;
@@ -911,6 +980,10 @@ vp_cmd_add() {
   local base id dest profile
   base=$(basename "$src")
   [[ -n $name ]] || name=${base%.*}
+  # Both end up inside double quotes in the profile; a quote or a line break
+  # would end the value early and could add keys of its own.
+  [[ $name != *[\"[:cntrl:]]* ]] || vp_die "the name may not contain double quotes or control characters (such as line breaks)"
+  [[ $base != *[\"[:cntrl:]]* ]] || vp_die "the file name may not contain double quotes or control characters; rename it first"
   id=$(vp_slug "$name")
   dest="${VP_CONF[VPN_DIR]}/$base"
   profile="$VP_PROFILE_DIR/$id.conf"
@@ -978,6 +1051,10 @@ vp_cmd_doctor() {
         "${PROFILE[CONFIG]:-${PROFILE[CONNECTION]}}" "${PROFILE[PASSWORD_MODE]}"
       if [[ ${PROFILE[TYPE]} == openvpn && ! -r ${PROFILE[CONFIG]} ]]; then
         printf 'warning: %s: config not readable\n' "${PROFILE[ID]}"
+        ok=0
+      fi
+      if [[ ${PROFILE[TYPE]} == openvpn && ${PROFILE[PASSWORD_MODE]} != none ]] && vp_uses_auth_nocache; then
+        printf 'warning: %s %s\n' "${PROFILE[ID]}" "$VP_AUTH_NOCACHE_WARNING"
         ok=0
       fi
     else

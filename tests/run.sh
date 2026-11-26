@@ -98,7 +98,7 @@ fi
 exit "${OPENVPN_EXIT:-0}"'
   # nmcli: canned connection list; record "up" calls and the passwd-file.
   stub nmcli 'case "$*" in
-  "-t -f NAME connection show") printf "%s\n" "Wired connection 1" "Office\\:Net" "work-nm" ;;
+  "-t -f TYPE,NAME connection show") printf "%s\n" "802-3-ethernet:Wired connection 1" "802-11-wireless:Home-WiFi" "vpn:Office\\:Net" "vpn:work-nm" "wireguard:wg-home" ;;
   "-t -f TYPE,NAME connection show --active") [[ -n ${NM_ACTIVE:-} ]] && printf "%s\n" "$NM_ACTIVE" ;;
   *" up "*)
     printf "nmcli argv:" >>"$STUB_LOG"; printf " [%s]" "$@" >>"$STUB_LOG"; echo >>"$STUB_LOG"
@@ -287,7 +287,7 @@ test_symlinked_profiles_and_vpn_dir() {
   assert_eq "$out" $'profile:linked\tLinked Profile\novpn:a.ovpn\ta.ovpn\novpn:c.ovpn\tc.ovpn\novpn:sub/b.ovpn\tsub/b.ovpn' "symlinked profile, VPN_DIR, and .ovpn followed"
   assert_contains "$(picker doctor 2>&1)" "profile: linked -> nm work-nm" "doctor sees the same profiles"
   picker connect c.ovpn </dev/null >/dev/null 2>&1
-  assert_contains "$(log)" "openvpn argv: [--config] [$HOME/vpn/c.ovpn]" "symlinked .ovpn connects"
+  assert_contains "$(log)" "openvpn argv: [--cd] [$HOME/elsewhere] [--config] [$HOME/vpn/c.ovpn]" "symlinked .ovpn connects from its real folder"
   teardown
 }
 
@@ -301,7 +301,7 @@ test_credentials_otp_from_op() {
   local l
   l=$(log)
   assert_contains "$l" "authfile:jdoe"$'\n'"123456" "username + OTP delivered on stdin"
-  assert_contains "$l" "openvpn argv: [--config] [$HOME/vpn/example.ovpn] [--auth-user-pass] [/dev/stdin]" "auth via stdin"
+  assert_contains "$l" "openvpn argv: [--cd] [$HOME/vpn] [--config] [$HOME/vpn/example.ovpn] [--auth-user-pass] [/dev/stdin]" "auth via stdin"
   assert_not_contains "$(grep '^openvpn argv' "$STUB_LOG")" "123456" "OTP not on command line"
   assert_contains "$l" "op read --no-newline --account my.1password.com op://Private/Example VPN/one-time password?attrtype=otp" "op account passed"
   # sudo is primed before the OTP is fetched.
@@ -402,7 +402,7 @@ test_no_credentials_for_plain_ovpn() {
   setup plain_ovpn
   : >"$HOME/vpn/plain.ovpn"
   picker connect plain.ovpn </dev/null >/dev/null 2>&1
-  assert_contains "$(log)" "openvpn argv: [--config] [$HOME/vpn/plain.ovpn]"$'\n' "plain openvpn"
+  assert_contains "$(log)" "openvpn argv: [--cd] [$HOME/vpn] [--config] [$HOME/vpn/plain.ovpn]"$'\n' "plain openvpn"
   assert_not_contains "$(log)" "auth-user-pass" "no auth file when none configured"
   teardown
 }
@@ -422,6 +422,84 @@ test_nm_connect() {
   assert_contains "$l" "passwdfile:vpn.secrets.password:123456" "OTP in NM passwd-file"
   assert_not_contains "$(grep '^nmcli argv' "$STUB_LOG")" "123456" "OTP not on nmcli command line"
   [[ -s $VPN_PICKER_STATE_FILE ]] && ok || bad "state file touched after nmcli up"
+  teardown
+}
+
+test_nm_match_only_vpn_types() {
+  setup nm_types
+  : >"$HOME/vpn/home-wifi.ovpn"
+  : >"$HOME/vpn/Wired connection 1.ovpn"
+  : >"$HOME/vpn/WG-Home.ovpn"
+  picker connect home-wifi.ovpn </dev/null >/dev/null 2>&1
+  assert_contains "$(log)" "openvpn argv: [--cd] [$HOME/vpn] [--config] [$HOME/vpn/home-wifi.ovpn]" "Wi-Fi connection with the same name is ignored"
+  assert_not_contains "$(log)" "nmcli argv" "Wi-Fi connection not brought up"
+  : >"$STUB_LOG"
+  picker connect "Wired connection 1.ovpn" </dev/null >/dev/null 2>&1
+  assert_not_contains "$(log)" "nmcli argv" "Ethernet connection with the same name is ignored"
+  : >"$STUB_LOG"
+  picker connect WG-Home.ovpn </dev/null >/dev/null 2>&1
+  assert_contains "$(log)" "nmcli argv: [--ask] [connection] [up] [id] [wg-home]" "WireGuard connection with the same name is used"
+  teardown
+}
+
+test_openvpn_cd_to_config_dir() {
+  setup openvpn_cd
+  mkdir -p "$HOME/vpn/office"
+  printf 'client\nca ca.crt\n' >"$HOME/vpn/office/office.ovpn"
+  printf 'NAME=Office\nCONFIG=office/office.ovpn\n' >"$XDG_CONFIG_HOME/vpn-picker/profiles/office.conf"
+  picker connect office </dev/null >/dev/null 2>&1
+  assert_contains "$(log)" "openvpn argv: [--cd] [$HOME/vpn/office] [--config] [$HOME/vpn/office/office.ovpn]" "--cd to the config folder comes first"
+  teardown
+}
+
+test_auth_nocache_warning() {
+  setup auth_nocache
+  printf 'client\n  auth-nocache\n' >"$HOME/vpn/nocache.ovpn"
+  printf 'client\n# auth-nocache\n' >"$HOME/vpn/commented.ovpn"
+  local p="$XDG_CONFIG_HOME/vpn-picker/profiles"
+  printf 'NAME="No Cache"\nCONFIG=nocache.ovpn\nUSERNAME=jdoe\nOTP_OP=op://Private/Example VPN/otp?attrtype=otp\n' >"$p/nocache.conf"
+  printf 'NAME="Args"\nCONFIG=commented.ovpn\nUSERNAME=jdoe\nOTP_OP=op://Private/Example VPN/otp?attrtype=otp\nOPENVPN_ARGS=--verb 3 --auth-nocache\n' >"$p/args.conf"
+  printf 'NAME="Fine"\nCONFIG=commented.ovpn\nUSERNAME=jdoe\nOTP_OP=op://Private/Example VPN/otp?attrtype=otp\n' >"$p/fine.conf"
+  local err
+  err=$(picker connect nocache </dev/null 2>&1 >/dev/null)
+  assert_contains "$err" "No Cache uses auth-nocache" "connect warns about auth-nocache in the .ovpn"
+  assert_contains "$(log)" "notify:VPN Picker No Cache uses auth-nocache" "connect notifies about auth-nocache"
+  assert_contains "$(log)" "openvpn argv" "connect still goes ahead"
+  : >"$STUB_LOG"
+  err=$(picker connect args </dev/null 2>&1 >/dev/null)
+  assert_contains "$err" "Args uses auth-nocache" "connect warns about --auth-nocache in OPENVPN_ARGS"
+  : >"$STUB_LOG"
+  err=$(picker connect fine </dev/null 2>&1 >/dev/null)
+  assert_not_contains "$err" "auth-nocache" "a commented-out auth-nocache is ignored"
+  local out
+  out=$(picker doctor 2>&1)
+  assert_contains "$out" "warning: nocache uses auth-nocache" "doctor warns for the .ovpn"
+  assert_contains "$out" "warning: args uses auth-nocache" "doctor warns for OPENVPN_ARGS"
+  assert_not_contains "$out" "warning: fine" "doctor quiet for a clean profile"
+  : >"$STUB_LOG"
+  err=$(picker connect nocache.ovpn </dev/null 2>&1 >/dev/null)
+  assert_not_contains "$err" "auth-nocache" "no warning when OpenVPN asks for credentials itself"
+  teardown
+}
+
+test_not_started_message() {
+  setup not_started
+  : >"$HOME/vpn/example.ovpn"
+  printf 'NAME=Example\nCONFIG=example.ovpn\nUSERNAME=jdoe\nPASSWORD_MODE=otp\n' >"$XDG_CONFIG_HOME/vpn-picker/profiles/example.conf"
+  printf '\n' | picker connect example >/dev/null 2>&1
+  assert_eq "$?" 1 "empty OTP cancels"
+  assert_contains "$(log)" "notify:VPN Picker Not connected: Example (no credentials were given)" "cancelled OTP explained"
+  assert_not_contains "$(log)" "OpenVPN exited" "no OpenVPN exit message when it never ran"
+  : >"$STUB_LOG"
+  stub sudo 'case "$1" in -v) exit 1 ;; -n) exit 1 ;; esac; exec "$@"'
+  picker connect example </dev/null >/dev/null 2>&1
+  assert_contains "$(log)" "notify:VPN Picker Not connected: Example (sudo was cancelled or failed)" "cancelled sudo explained"
+  assert_not_contains "$(log)" "openvpn argv" "openvpn not started after sudo fails"
+  : >"$STUB_LOG"
+  make_stubs
+  printf 'NAME=Example\nCONFIG=example.ovpn\nUSERNAME=jdoe\nOTP_OP=op://Private/Example VPN/otp?attrtype=otp\n' >"$XDG_CONFIG_HOME/vpn-picker/profiles/example.conf"
+  OPENVPN_EXIT=1 picker connect example </dev/null >/dev/null 2>&1
+  assert_contains "$(log)" "notify:VPN Picker OpenVPN exited (1): Example" "real OpenVPN exit still reported"
   teardown
 }
 
@@ -461,7 +539,7 @@ test_menu_connect_and_disconnect() {
   l=$(log)
   assert_contains "$(cat "$STUB_LOG.menu")" "Status: not connected"$'\n'"plain.ovpn" "menu rows"
   assert_contains "$l" "terminal:$PICKER __terminal-connect ovpn:plain.ovpn" "connect runs in a terminal"
-  assert_contains "$l" "openvpn argv: [--config] [$HOME/vpn/plain.ovpn]" "openvpn started from menu"
+  assert_contains "$l" "openvpn argv: [--cd] [$HOME/vpn] [--config] [$HOME/vpn/plain.ovpn]" "openvpn started from menu"
   : >"$STUB_LOG"
   NM_ACTIVE="vpn:Office" MENU_CHOICE="Disconnect Office" picker menu </dev/null >/dev/null 2>&1
   assert_contains "$(log)" "nmcli down:Office" "disconnect NM from menu"
@@ -472,6 +550,39 @@ test_menu_connect_and_disconnect() {
   : >"$STUB_LOG"
   MENU_CHOICE="" picker menu </dev/null >/dev/null 2>&1
   assert_eq "$(log)" "" "cancel does nothing"
+  teardown
+}
+
+test_menu_rows_unique() {
+  setup menu_unique
+  export VPN_PICKER_MENU=walker
+  local p="$XDG_CONFIG_HOME/vpn-picker/profiles"
+  : >"$HOME/vpn/a.ovpn"
+  : >"$HOME/vpn/b.ovpn"
+  printf 'NAME="Status: not connected"\nCONFIG=a.ovpn\n' >"$p/a.conf"
+  printf 'NAME="Disconnect Office"\nCONFIG=b.ovpn\n' >"$p/b.conf"
+  MENU_CHOICE="Status: not connected [2]" picker menu </dev/null >/dev/null 2>&1
+  assert_contains "$(cat "$STUB_LOG.menu")" "Status: not connected"$'\n'"Status: not connected [2]" "entry label colliding with the status row gets a suffix"
+  assert_contains "$(log)" "__terminal-connect profile:a" "suffixed entry connects"
+  : >"$STUB_LOG"
+  NM_ACTIVE="vpn:Office" MENU_CHOICE="Disconnect Office [2]" picker menu </dev/null >/dev/null 2>&1
+  assert_contains "$(log)" "__terminal-connect profile:b" "entry named like a Disconnect row connects, not disconnects"
+  assert_not_contains "$(log)" "nmcli down" "Disconnect row not triggered by the look-alike entry"
+  : >"$STUB_LOG"
+  NM_ACTIVE="vpn:Office" MENU_CHOICE="Disconnect Office" picker menu </dev/null >/dev/null 2>&1
+  assert_contains "$(log)" "nmcli down:Office" "real Disconnect row still disconnects"
+  # Two OpenVPN tunnels from the same config: one Disconnect row per process.
+  mkdir -p "$T/proc/11" "$T/proc/12"
+  printf 'openvpn\0--config\0%s\0' "$HOME/vpn/a.ovpn" >"$T/proc/11/cmdline"
+  printf 'openvpn\0--config\0%s\0' "$HOME/vpn/a.ovpn" >"$T/proc/12/cmdline"
+  printf 'openvpn\n' >"$T/proc/11/comm"
+  printf 'openvpn\n' >"$T/proc/12/comm"
+  stub kill 'printf "kill:%s\n" "$*" >>"$STUB_LOG"; rm -rf "$VPN_PICKER_PROC_DIR/$2"'
+  : >"$STUB_LOG"
+  PGREP_PIDS="11 12" MENU_CHOICE="Disconnect Status: not connected (pid 12)" picker menu </dev/null >/dev/null 2>&1
+  assert_contains "$(cat "$STUB_LOG.menu")" "Disconnect Status: not connected (pid 11)"$'\n'"Disconnect Status: not connected (pid 12)" "OpenVPN Disconnect rows name the pid"
+  assert_contains "$(log)" "kill:-TERM 12" "the chosen tunnel is the one stopped"
+  assert_not_contains "$(log)" "kill:-TERM 11" "the other tunnel keeps running"
   teardown
 }
 
@@ -531,6 +642,22 @@ test_add() {
   assert_not_contains "$(picker list)" "ovpn:Download.ovpn" "added config claimed by profile"
   picker add "$T/Download.ovpn" --name "Example VPN" >/dev/null 2>&1
   assert_eq "$?" 1 "refuses to overwrite"
+  local err
+  err=$(picker add "$T/Download.ovpn" --name $'Evil\nPASSWORD_MODE=none' 2>&1)
+  assert_eq "$?" 1 "name with a line break refused"
+  assert_contains "$err" "control characters" "line break explained"
+  picker add "$T/Download.ovpn" --name 'Evil" OTP_OP="x' >/dev/null 2>&1
+  assert_eq "$?" 1 "name with a double quote refused"
+  printf 'client\n' >"$T/bad\"name.ovpn"
+  picker add "$T/bad\"name.ovpn" --name "Fine Name" >/dev/null 2>&1
+  assert_eq "$?" 1 "file name with a double quote refused"
+  assert_eq "$(find "$XDG_CONFIG_HOME/vpn-picker/profiles" -name 'evil*' | wc -l)" "0" "no profile written for a refused name"
+  printf 'client\n' >"$T/Other.ovpn"
+  picker add "$T/Other.ovpn" --name "O'Brien VPN" >/dev/null 2>&1
+  assert_eq "$?" 0 "single quote allowed"
+  # shellcheck source=/dev/null
+  (source "$PICKER"; vp_load_global_config; vp_load_profile "$XDG_CONFIG_HOME/vpn-picker/profiles/o-brien-vpn.conf"; printf '%s' "${PROFILE[NAME]}") >"$T/name"
+  assert_eq "$(cat "$T/name")" "O'Brien VPN" "single quote kept in NAME"
   teardown
 }
 

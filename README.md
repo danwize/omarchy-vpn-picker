@@ -86,8 +86,11 @@ If you only installed the plugin, use the full path
 ## Adding a VPN
 
 **Simplest:** drop the provider's `.ovpn` file into `~/vpn`. It appears in the
-menu under its file name. If a NetworkManager connection has the same name as
-the file (ignoring case), the picker connects through NetworkManager instead.
+menu under its file name. If a NetworkManager VPN or WireGuard connection
+has the same name as the file (ignoring case), the picker connects through
+NetworkManager instead; Wi-Fi and wired connections never match. OpenVPN
+starts in the config file's folder, so relative `ca`, `cert`, `key`, and
+`tls-auth` paths inside it work.
 `~/vpn` may be a symlink, and symlinked subfolders, `.ovpn` files, and
 profiles are followed.
 
@@ -98,7 +101,8 @@ omarchy-vpn-picker add ~/Downloads/example.ovpn --name "Example VPN"
 ```
 
 That copies the file into `~/vpn` with mode 600 and creates
-`~/.config/vpn-picker/profiles/example-vpn.conf`. Edit the profile to add
+`~/.config/vpn-picker/profiles/example-vpn.conf`. The name and the file name
+may not contain double quotes or control characters such as line breaks. Edit the profile to add
 credentials. You can also write profiles by hand; see
 [`examples/profiles/example.conf`](examples/profiles/example.conf).
 
@@ -144,7 +148,7 @@ whitespace following `=` (`OTP_SEPARATOR= # none` sets an empty value, while
 | `PASSWORD_MODE` | What is sent as the password. `none` sends nothing and OpenVPN prompts itself. `password` sends the password. `otp` sends the OTP alone. `password+otp` sends the password, then `OTP_SEPARATOR`, then the OTP. |
 | `OTP_SEPARATOR` | Text between password and OTP in `password+otp`. Defaults to nothing. |
 | `OP_ACCOUNT` | 1Password account for `op --account`, if you have several. |
-| `OPENVPN_ARGS` | Extra OpenVPN arguments, split on spaces, e.g. `--verb 3`. Do not use `--auth-nocache`: credentials are sent once on stdin, so OpenVPN cannot re-read them on renegotiation. |
+| `OPENVPN_ARGS` | Extra OpenVPN arguments, split on spaces, e.g. `--verb 3`. Do not use `--auth-nocache` (here or in the `.ovpn` file) with picker-supplied credentials: they are sent once on stdin, so OpenVPN cannot answer the next renegotiation and the tunnel drops. `doctor` warns about it, and so does a notification when you connect. |
 | `NM_SECRET_KEY` | NetworkManager secret that receives the password. Defaults to `vpn.secrets.password`. |
 
 When `PASSWORD_MODE` is unset, it is inferred:
@@ -217,7 +221,8 @@ omarchy-vpn-picker doctor          check dependencies and profiles
 
 ## How credentials are handled
 
-- OpenVPN runs as `sudo openvpn --config <file> --auth-user-pass /dev/stdin`.
+- OpenVPN runs as
+  `sudo openvpn --cd <config folder> --config <file> --auth-user-pass /dev/stdin`.
   The username and password go into that pipe through the shell's `printf`
   builtin, so they never show up in a process list and never touch disk.
 - For NetworkManager, the password goes to
