@@ -28,6 +28,11 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+# Only Omarchy machines ship the plugin validator; say so rather than skip silently.
+if ! command -v omarchy-plugin-validate >/dev/null 2>&1; then
+  echo "ci: omarchy-plugin-validate not found; skipping that one check (run 'omarchy plugin validate .' on an Omarchy machine)"
+fi
+
 echo "== ShellCheck"
 "${shellcheck[@]}" -x bin/omarchy-vpn-picker install.sh tests/run.sh tests/ci.sh
 
