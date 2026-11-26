@@ -1,0 +1,17 @@
+# Never commit VPN configs, keys, or credentials. Real profiles live in
+# ~/.config/vpn-picker, outside this repository.
+*.ovpn
+*.conf
+!examples/profiles/example.conf
+*.key
+*.crt
+*.pem
+*.p12
+*.pfx
+*.auth
+*credentials*
+*creds*
+auth.txt
+.env
+profiles/
+!examples/profiles/

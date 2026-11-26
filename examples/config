@@ -1,0 +1,24 @@
+# omarchy-vpn-picker settings. Every line is optional.
+# Format: KEY=value, one per line. The file is parsed, never executed.
+# A " # comment" after a value is ignored; quote a value that contains " #".
+
+# Directory scanned (recursively) for *.ovpn files. Each one shows up in the
+# menu without needing a profile. ~ and $HOME are expanded. Symlinks (to the
+# directory, subfolders, or files) are followed.
+VPN_DIR=~/vpn
+
+# Menu program: auto (Omarchy menu, then walker, fuzzel, rofi, wofi),
+# omarchy, walker, fuzzel, rofi, wofi, or any dmenu-style command.
+MENU=auto
+
+# Terminal used for connecting (sudo and OpenVPN output show there).
+# auto uses xdg-terminal-exec. Any command that takes the program to run as
+# trailing arguments works, e.g. "alacritty -e".
+TERMINAL=auto
+
+# 1Password account to use with `op` when you are signed in to several.
+#OP_ACCOUNT=my.1password.com
+
+# Extra arguments for every OpenVPN connection.
+#OPENVPN_ARGS=--verb 3
+# (--auth-nocache breaks reconnects: credentials are sent once on stdin.)

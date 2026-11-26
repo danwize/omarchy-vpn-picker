@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.danwize.vpn-picker",
+  "name": "VPN Picker",
+  "version": "0.1.0",
+  "author": "danwize",
+  "license": "MIT",
+  "homepage": "https://github.com/danwize/omarchy-vpn-picker",
+  "description": "VPN status in the bar and a menu to connect OpenVPN configs or NetworkManager VPNs, with drop-in profiles and optional 1Password username, password, and OTP fill.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "VpnWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "VPN Picker",
+    "description": "Shows whether a VPN is connected. Click to pick a VPN or disconnect; middle-click to refresh.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 10,
+      "hideWhenDisconnected": false
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 3600,
+        "step": 1,
+        "defaultValue": 10
+      },
+      {
+        "key": "hideWhenDisconnected",
+        "type": "boolean",
+        "label": "Hide when no VPN is connected",
+        "defaultValue": false
+      }
+    ]
+  }
+}
