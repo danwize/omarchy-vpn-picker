@@ -748,10 +748,18 @@ run_tests() {
     f=$((f + b))
   done <"$results"
   printf '%d passed, %d failed\n' "$p" "$f"
+  if ((p + f == 0)); then
+    echo "FAIL no test results were recorded" >&2
+    return 1
+  fi
   ((f == 0))
 }
 
 RESULTS=$(mktemp)
 trap 'rm -f "$RESULTS"' EXIT
-mapfile -t ALL_TESTS < <(declare -F | awk '{print $3}' | grep '^test_')
+mapfile -t ALL_TESTS < <(declare -F | awk '$3 ~ /^test_/ {print $3}')
+if ((${#ALL_TESTS[@]} == 0)); then
+  echo "FAIL no test_ functions were found" >&2
+  exit 1
+fi
 run_tests "$RESULTS" "${ALL_TESTS[@]}"

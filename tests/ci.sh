@@ -40,7 +40,16 @@ echo "== Tests"
 tests/run.sh
 
 echo "== No VPN configs or keys committed"
-if git ls-files | grep -Ei '\.(ovpn|key|crt|pem|p12|pfx)$'; then
+# Match in bash so a missing or failing grep cannot turn this check into a pass.
+tracked=$(git ls-files)
+secret_files=()
+shopt -s nocasematch
+while IFS= read -r f; do
+  [[ $f =~ \.(ovpn|key|crt|pem|p12|pfx)$ ]] && secret_files+=("$f")
+done <<<"$tracked"
+shopt -u nocasematch
+if ((${#secret_files[@]} > 0)); then
+  printf '%s\n' "${secret_files[@]}"
   echo "VPN configs, keys, or certificates must not be committed" >&2
   exit 1
 fi
