@@ -259,8 +259,8 @@ the manifest and JSON checks are never skipped. Off Omarchy (for example on
 the Ubuntu Actions runner), `omarchy-plugin-validate` is missing, so that one
 check is skipped and `tests/ci.sh` says so.
 
-The GitHub Actions workflow (`.github/workflows/ci.yml`) only calls
-`tests/ci.sh`. If the Actions job reports that it "was not started" (for
+The GitHub Actions workflow (`.github/workflows/ci.yml`) installs
+`shellcheck` and `jq`, then calls `tests/ci.sh`. If the Actions job reports that it "was not started" (for
 example, because the account is locked over billing), nothing in the code was
 checked. Run `tests/ci.sh` locally and treat its result as the CI result.
 
